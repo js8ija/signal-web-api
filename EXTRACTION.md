@@ -101,3 +101,8 @@ Shared resolver: src/server/paths.node.ts.
 ## License
 
 AGPL-3.0-only; see LICENSE.
+
+## Runtime notes (2026-09-08)
+- tsx can break libsignal node-gyp-build __dirname; scripts/start.mjs symlinks ./prebuilds
+- SQL worker needs bundles/chunks/* plus @signalapp/sqlcipher and @signalapp/ringrtc
+- Use Node 24.15.x
