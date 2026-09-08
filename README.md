@@ -66,3 +66,9 @@ Smoke (needs native modules + SQL worker): `npm run smoke`
 - `GET /api/proxy?url=...` - allowlisted CORS forwarder
 
 Point `STATIC_ROOT` at a full ochen1-signal-web tree to serve Desktop UI static bundles.
+
+## Pair with js8ija/signal-web
+
+Same-origin: set `STATIC_ROOT` to a signal-web (or ochen1) checkout that has `web/static` + `bundles-web`.
+
+Cross-origin: UI uses `?apiOrigin=` / `__SIGNAL_WEB_API_ORIGIN__` / meta `signal-web-api-origin` (see signal-web `web/bridge/origin.web.ts`). This API already sends permissive CORS on HTTP routes.
