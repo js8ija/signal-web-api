@@ -17,10 +17,9 @@ import os from 'node:os';
 
 import { rendererConfigSchema } from '../../vendor/ts/types/RendererConfig.std.ts';
 import type { BootPayload } from '../bridge/protocol.std.ts';
+import { ASSETS_ROOT as REPO_ROOT } from './paths.node.ts';
 
 // ---- helpers -----------------------------------------------------------------
-
-const REPO_ROOT = join(__dirname, '..', '..');
 
 function readJson<T>(path: string): T {
   return JSON.parse(readFileSync(path, 'utf-8')) as T;
