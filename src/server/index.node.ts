@@ -6,7 +6,12 @@
  *
  * ENV:
  *   PORT                  HTTP port (default 8915)
- *   SIGNAL_WEB_DATA       Data directory (default ~/.signal-web)
+ *   SIGNAL_DATA_DIR       Data directory (default ~/.signal-web)
+ *                         Alias: SIGNAL_WEB_DATA (legacy)
+ *   SIGNAL_ASSETS_ROOT    Assets root for config/build/bundles/_locales/assets
+ *                         (default: process.cwd())
+ *   STATIC_ROOT           Optional Desktop UI static root; if unset, UI static
+ *                         bundles are not mounted (API-only).
  *   SIGNAL_ENV            production | staging | development (default production)
  *   SIGNAL_WEB_LOCALE     Default locale hint (default 'en')
  *   SIGNAL_NEST_API_BASE  LeanScrm Nest base (e.g. http://127.0.0.1:3010);
@@ -17,7 +22,6 @@ import http from 'node:http';
 import { join, extname, resolve } from 'node:path';
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { mkdirSync } from 'node:fs';
-import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { encode as msgpackEncode, decode as msgpackDecode } from '@msgpack/msgpack';
 import { WebSocketServer } from 'ws';
@@ -42,14 +46,20 @@ import { handleProxyRequest } from './proxy.node.ts';
 import { handleNestProxy, nestApiBaseFromEnv } from './nest-proxy.node.ts';
 import { registerSession, pushToAll, sendInitialPushes } from './push.node.ts';
 import type { CallbackRequestFrame } from '../bridge/protocol.std.ts';
+import {
+  PORT,
+  DATA_DIR,
+  ASSETS_ROOT,
+  REPO_ROOT,
+  STATIC_ROOT,
+  SIGNAL_ENV,
+  LOCALE_HINT,
+  nativeManifestPath,
+  nativeManifestFallbackPath,
+} from './paths.node.ts';
 
 // ---- configuration -----------------------------------------------------------
 
-const PORT = parseInt(process.env.PORT ?? '8915', 10);
-const DATA_DIR = process.env.SIGNAL_WEB_DATA ?? join(os.homedir(), '.signal-web');
-const SIGNAL_ENV = process.env.SIGNAL_ENV ?? 'production';
-const LOCALE_HINT = process.env.SIGNAL_WEB_LOCALE ?? 'en';
-const REPO_ROOT = join(__dirname, '..', '..');
 // Identifies this server process; the native handle registry is reset on
 // restart, so the browser reloads when it sees a new id (see protocol).
 const SERVER_SESSION_ID = randomUUID();
@@ -97,22 +107,24 @@ function getMime(filepath: string): string {
 
 // ---- static file serving ----------------------------------------------------
 
-// Map of URL prefix → filesystem root
-const STATIC_MOUNTS: Array<{ prefix: string; root: string }> = [
-  { prefix: '/bundles-web', root: join(REPO_ROOT, 'bundles-web') },
-  { prefix: '/bundles', root: join(REPO_ROOT, 'bundles') },
-  { prefix: '/stylesheets', root: join(REPO_ROOT, 'stylesheets') },
-  { prefix: '/fonts', root: join(REPO_ROOT, 'fonts') },
-  { prefix: '/images', root: join(REPO_ROOT, 'images') },
-  { prefix: '/sounds', root: join(REPO_ROOT, 'sounds') },
-  { prefix: '/build', root: join(REPO_ROOT, 'build') },
-  // intl-tel-input images referenced from CSS as ../node_modules/intl-tel-input/build/img/
-  {
-    prefix: '/node_modules/intl-tel-input/build/img',
-    root: join(REPO_ROOT, 'node_modules', 'intl-tel-input', 'build', 'img'),
-  },
-  { prefix: '/', root: join(REPO_ROOT, 'web', 'static') },
-];
+// Map of URL prefix → filesystem root.
+// Desktop UI static mounts are only enabled when STATIC_ROOT is set.
+const STATIC_MOUNTS: Array<{ prefix: string; root: string }> = STATIC_ROOT
+  ? [
+      { prefix: '/bundles-web', root: join(STATIC_ROOT, 'bundles-web') },
+      { prefix: '/bundles', root: join(STATIC_ROOT, 'bundles') },
+      { prefix: '/stylesheets', root: join(STATIC_ROOT, 'stylesheets') },
+      { prefix: '/fonts', root: join(STATIC_ROOT, 'fonts') },
+      { prefix: '/images', root: join(STATIC_ROOT, 'images') },
+      { prefix: '/sounds', root: join(STATIC_ROOT, 'sounds') },
+      { prefix: '/build', root: join(STATIC_ROOT, 'build') },
+      {
+        prefix: '/node_modules/intl-tel-input/build/img',
+        root: join(STATIC_ROOT, 'node_modules', 'intl-tel-input', 'build', 'img'),
+      },
+      { prefix: '/', root: join(STATIC_ROOT, 'web', 'static') },
+    ]
+  : [];
 
 function serveStaticFile(urlPath: string, res: http.ServerResponse): boolean {
   // Prevent directory traversal
@@ -402,7 +414,9 @@ export async function startServer(): Promise<http.Server> {
   await initializeSQL(DATA_DIR, PKG_VERSION);
 
   // Load native manifest
-  const manifestPath = join(REPO_ROOT, 'web', 'generated', 'native-manifest.json');
+  const manifestPath = existsSync(nativeManifestPath())
+    ? nativeManifestPath()
+    : nativeManifestFallbackPath();
   if (existsSync(manifestPath)) {
     try {
       const m = JSON.parse(readFileSync(manifestPath, 'utf-8')) as {
@@ -467,6 +481,8 @@ export async function startServer(): Promise<http.Server> {
     server.listen(PORT, () => {
       console.log(`Signal Web bridge listening on http://localhost:${PORT}`);
       console.log(`  Data dir: ${DATA_DIR}`);
+      console.log(`  Assets root: ${ASSETS_ROOT}`);
+      console.log(`  Static UI: ${STATIC_ROOT ?? '(disabled — set STATIC_ROOT to enable)'}`);
       console.log(`  Env: ${SIGNAL_ENV}`);
       const nestBase = nestApiBaseFromEnv();
       if (nestBase) {

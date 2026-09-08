@@ -13,8 +13,7 @@ import https from 'node:https';
 import tls from 'node:tls';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-
-const REPO_ROOT = join(__dirname, '..', '..');
+import { ASSETS_ROOT as REPO_ROOT } from './paths.node.ts';
 
 let cachedCa: Array<string> | undefined;
 

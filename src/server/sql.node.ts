@@ -17,6 +17,7 @@ import { serialize, deserialize } from 'node:v8';
 import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { format } from 'node:util';
+import { sqlWorkerPath } from './paths.node.ts';
 
 // ---- types (copied from ts/sql/main.main.ts to avoid Electron import) --------
 
@@ -47,7 +48,7 @@ const MIN_TRACE_DURATION = 40;
 type PoolEntry = { worker: Worker; load: number };
 type PendingEntry = { resolve: (v: unknown) => void; reject: (e: Error) => void };
 
-const SQL_WORKER_PATH = join(__dirname, '..', '..', 'bundles', 'workers', 'sql.js');
+const SQL_WORKER_PATH = sqlWorkerPath();
 
 let pool: Array<PoolEntry> = [];
 let seq = 0;

@@ -23,9 +23,11 @@ import WebSocket from 'ws';
 // Import server bootstrap
 // We set env before importing
 const tmpDir = mkdtempSync(join(os.tmpdir(), 'signal-web-smoke-'));
-process.env.SIGNAL_WEB_DATA = tmpDir;
+process.env.SIGNAL_DATA_DIR = tmpDir;
+process.env.SIGNAL_WEB_DATA = tmpDir; // legacy alias
 process.env.PORT = '0'; // random port
 process.env.SIGNAL_ENV = 'development';
+process.env.SIGNAL_ASSETS_ROOT = process.env.SIGNAL_ASSETS_ROOT ?? process.cwd();
 
 // Dynamically import server after setting env
 import type { Server as HttpServer } from 'node:http';
