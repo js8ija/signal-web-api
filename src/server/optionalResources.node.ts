@@ -31,7 +31,10 @@ export function initOptionalResources(repoRoot: string, dataDir: string): void {
   mkdirSync(resourcesDir, { recursive: true });
   ready = readFile(join(repoRoot, 'build', 'optional-resources.json'), 'utf-8')
     .then(json => {
-      declarations = JSON.parse(json) as Record<string, ResourceDecl>;
+      declarations = Object.assign(
+        Object.create(null) as Record<string, ResourceDecl>,
+        JSON.parse(json) as Record<string, ResourceDecl>
+      );
     })
     .catch(err => {
       console.warn('[optional-resources] could not load declarations:', err);
@@ -57,8 +60,11 @@ export async function getOptionalResource(
   if (declarations == null || resourcesDir == null) {
     return undefined;
   }
+  if (!Object.prototype.hasOwnProperty.call(declarations, name) || /[/\\]/.test(name)) {
+    return undefined;
+  }
   const decl = declarations[name];
-  if (decl == null || /[/\\]/.test(name)) {
+  if (decl == null) {
     return undefined;
   }
 

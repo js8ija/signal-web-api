@@ -20,6 +20,7 @@ import { MAX_BODY_NEST, readBody, sendPayloadTooLarge } from './http-util.node.t
 export const NEST_PROXY_PREFIX = '/api/nest';
 export const NEST_CONFIG_PATH = '/api/nest-config';
 
+/** OPTIONS is answered as a CORS preflight in handleHttpRequest, not forwarded. */
 const ALLOWED_METHODS = new Set([
   'GET',
   'HEAD',
@@ -27,8 +28,32 @@ const ALLOWED_METHODS = new Set([
   'PUT',
   'PATCH',
   'DELETE',
-  'OPTIONS',
 ]);
+
+const NEST_REQ_HEADERS = new Set(['accept', 'content-type', 'user-agent']);
+const NEST_HOP_BY_HOP = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+  'host',
+  'cookie',
+  'cookie2',
+  'authorization',
+]);
+
+export function nestAllowsMethod(method: string): boolean {
+  return ALLOWED_METHODS.has(method.toUpperCase());
+}
+
+export function getNestTimeoutMs(): number {
+  const n = parseInt(process.env.SIGNAL_NEST_TIMEOUT_MS ?? '30000', 10);
+  return Number.isFinite(n) && n > 0 ? Math.min(n, 120_000) : 30_000;
+}
 
 /** Upstream Nest base, e.g. http://127.0.0.1:3010. Empty = proxy disabled. */
 export function nestApiBaseFromEnv(): string {
@@ -184,19 +209,29 @@ export async function handleNestProxy(
     accept: req.headers.accept ?? '*/*',
     'user-agent': 'signal-web-nest-proxy/1',
   };
-  if (req.headers['content-type']) {
-    headers['content-type'] = req.headers['content-type'];
-  } else if (body.length > 0) {
-    headers['content-type'] = 'application/json';
+  for (const name of NEST_REQ_HEADERS) {
+    const value = req.headers[name];
+    if (value != null && !NEST_HOP_BY_HOP.has(name)) {
+      headers[name] = value;
+    }
   }
-  if (req.headers.authorization) {
-    headers.authorization = req.headers.authorization;
+  if (!headers['content-type'] && body.length > 0) {
+    headers['content-type'] = 'application/json';
   }
   if (body.length > 0) {
     headers['content-length'] = body.length;
   }
 
+  const timeoutMs = getNestTimeoutMs();
   await new Promise<void>(resolve => {
+    let settled = false;
+    const done = (): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve();
+    };
     const upstream = lib.request(
       {
         protocol: targetUrl.protocol,
@@ -205,27 +240,49 @@ export async function handleNestProxy(
         path: targetUrl.pathname + targetUrl.search,
         method,
         headers,
+        timeout: timeoutMs,
       },
       upstreamRes => {
         const outHeaders: http.OutgoingHttpHeaders = {
           'cache-control': 'no-cache, no-transform',
+          'x-content-type-options': 'nosniff',
         };
         const ct = upstreamRes.headers['content-type'];
         if (ct) outHeaders['content-type'] = ct;
         res.writeHead(upstreamRes.statusCode ?? 502, outHeaders);
         upstreamRes.pipe(res);
-        upstreamRes.on('end', () => resolve());
-        upstreamRes.on('error', () => resolve());
+        upstreamRes.on('end', () => done());
+        upstreamRes.on('error', () => done());
       }
     );
+    const failTimeout = (): void => {
+      if (settled) {
+        return;
+      }
+      upstream.destroy();
+      if (!res.headersSent) {
+        res.writeHead(504, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Nest upstream timeout' }));
+      } else {
+        res.end();
+      }
+      done();
+    };
+    upstream.setTimeout(timeoutMs, failTimeout);
+    upstream.on('timeout', failTimeout);
     upstream.on('error', err => {
       if (!res.headersSent) {
+        const timedOut = (err as NodeJS.ErrnoException).code === 'ECONNRESET' && settled;
+        if (timedOut) {
+          done();
+          return;
+        }
         res.writeHead(502, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Nest upstream failed', message: err.message }));
       } else {
         res.end();
       }
-      resolve();
+      done();
     });
     req.on('close', () => {
       upstream.destroy();

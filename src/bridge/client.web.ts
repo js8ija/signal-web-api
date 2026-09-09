@@ -39,6 +39,31 @@ export type CallbackTarget = Record<string, unknown>;
 const RECONNECT_BASE_DELAY_MS = 250;
 const RECONNECT_MAX_DELAY_MS = 10_000;
 
+function readApiToken(): string | undefined {
+  if (typeof window === 'undefined') {
+    return undefined;
+  }
+  const injected = (window as unknown as { __SIGNAL_WEB_API_TOKEN__?: unknown })
+    .__SIGNAL_WEB_API_TOKEN__;
+  if (typeof injected === 'string' && injected.length > 0) {
+    return injected;
+  }
+  try {
+    const q = new URLSearchParams(window.location.search).get('token');
+    if (q) {
+      return q;
+    }
+  } catch {
+    /* ignore */
+  }
+  try {
+    const stored = window.localStorage?.getItem('signal-web.api-token');
+    return stored || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function collectMethodNames(target: CallbackTarget): Array<string> {
   const names = new Set<string>();
   let proto: unknown = target;
@@ -86,8 +111,14 @@ export class BridgeClient {
       return;
     }
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${proto}//${window.location.host}${BRIDGE_WS_PATH}`;
-    const socket = new WebSocket(url);
+    const token = readApiToken();
+    const url = new URL(`${proto}//${window.location.host}${BRIDGE_WS_PATH}`);
+    if (token) {
+      url.searchParams.set('token', token);
+    }
+    const socket = token
+      ? new WebSocket(url.toString(), [token])
+      : new WebSocket(url.toString());
     socket.binaryType = 'arraybuffer';
     this.#socket = socket;
 
@@ -291,6 +322,10 @@ export class BridgeClient {
     xhr.open('POST', BRIDGE_SYNC_PATH, false);
     xhr.overrideMimeType('text/plain; charset=x-user-defined');
     xhr.setRequestHeader('content-type', 'application/x-msgpack');
+    const token = readApiToken();
+    if (token) {
+      xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+    }
     xhr.send(encode(frame, { ignoreUndefined: true, useBigInt64: true }));
     if (xhr.status !== 200) {
       throw new Error(

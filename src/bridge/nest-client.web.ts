@@ -55,20 +55,38 @@ declare global {
   }
 }
 
+/**
+ * Resolve the Nest HTTP base. Never reads `?apiBase=` (attacker-controllable).
+ * Prefer the same-origin proxy `clientBase` from `/api/nest-config`.
+ */
 export function resolveNestApiBase(config?: NestConfig | null): string {
-  if (typeof window !== 'undefined') {
-    try {
-      const q = new URLSearchParams(window.location.search).get('apiBase');
-      if (q) return q.replace(/\/$/, '');
-    } catch {
-      /* ignore */
-    }
-    const cfg = window.__MY_RENDER_CONFIG__;
-    if (cfg?.apiBase) return cfg.apiBase.replace(/\/$/, '');
+  if (config?.enabled && config.clientBase) {
+    return config.clientBase.replace(/\/$/, '');
   }
-  if (config?.clientBase) return config.clientBase.replace(/\/$/, '');
-  if (config?.apiBase) return config.apiBase.replace(/\/$/, '');
-  return 'http://127.0.0.1:3010';
+  if (config?.clientBase) {
+    return config.clientBase.replace(/\/$/, '');
+  }
+  if (config?.apiBase) {
+    return config.apiBase.replace(/\/$/, '');
+  }
+  throw new Error('Nest API base is not configured (set SIGNAL_NEST_API_BASE on the bridge)');
+}
+
+/** Persist identifiers only — never password or storageServiceKey (H4). */
+export function sanitizeLinkedSessionForStorage(session: LinkedSession): Record<string, unknown> {
+  return {
+    linkedAt: session.linkedAt,
+    deviceName: session.deviceName,
+    provisioningSessionId: session.provisioningSessionId,
+    credentials: {
+      username: session.credentials.username,
+      deviceId: session.credentials.deviceId,
+      aci: session.credentials.aci,
+      pni: session.credentials.pni,
+      number: session.credentials.number,
+    },
+    registrationIds: session.registrationIds,
+  };
 }
 
 export async function fetchNestConfig(): Promise<NestConfig | null> {
@@ -265,7 +283,7 @@ export function loadLinkedSession(): LinkedSession | null {
 }
 
 export function saveLinkedSession(session: LinkedSession): void {
-  localStorage.setItem(LINKED_SESSION_KEY, JSON.stringify(session));
+  localStorage.setItem(LINKED_SESSION_KEY, JSON.stringify(sanitizeLinkedSessionForStorage(session)));
 }
 
 export function clearLinkedSession(): void {

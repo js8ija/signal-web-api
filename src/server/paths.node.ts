@@ -16,13 +16,25 @@
  *                        (default: process.cwd() — run from package root)
  *   STATIC_ROOT          Optional Desktop UI static root. If unset, the server
  *                        does not mount Desktop UI bundles (API-only mode).
- *   SIGNAL_CORS_ORIGIN   CORS Allow-Origin (default *). Set a concrete origin
- *                        to lock down cross-origin browser access.
+ *   SIGNAL_CORS_ORIGIN   Extra CORS origins (comma-separated). Default is the
+ *                        loopback origins for the bound port — never `*`.
+ *   SIGNAL_ALLOWED_HOSTS Extra Host header values (comma-separated).
  */
 
-import { join, resolve, sep } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { existsSync, realpathSync } from 'node:fs';
 import os from 'node:os';
+
+let boundPort: number | undefined;
+
+/** Record the port actually bound (PORT=0 → ephemeral). */
+export function setBoundPort(port: number): void {
+  boundPort = port;
+}
+
+export function getEffectivePort(): number {
+  return boundPort ?? getPort();
+}
 
 export function getPort(): number {
   const n = parseInt(process.env.PORT ?? '8915', 10);
@@ -66,8 +78,16 @@ export function getLocaleHint(): string {
   return process.env.SIGNAL_WEB_LOCALE ?? 'en';
 }
 
+/**
+ * Configured extra CORS origin(s), or the first loopback origin.
+ * Never returns `*`.
+ */
 export function getCorsOrigin(): string {
-  return process.env.SIGNAL_CORS_ORIGIN?.trim() || '*';
+  const extra = process.env.SIGNAL_CORS_ORIGIN?.trim();
+  if (extra && extra !== '*') {
+    return extra.split(',')[0]!.trim();
+  }
+  return `http://127.0.0.1:${getEffectivePort()}`;
 }
 
 export function sqlWorkerPath(): string {
@@ -85,8 +105,9 @@ export function nativeManifestFallbackPath(): string {
 
 /**
  * Lexical confinement: resolved `child` is `parent` or a descendant.
- * When `followReal` is true and both paths exist, also require realpath
- * to stay inside (blocks symlink escapes).
+ * When `followReal` is true, existing paths are compared via realpath.
+ * Missing children resolve the nearest existing ancestor (blocks symlink
+ * escapes on create).
  */
 export function isFsInside(
   child: string,
@@ -103,12 +124,30 @@ export function isFsInside(
     return true;
   }
   try {
-    if (!existsSync(c) || !existsSync(p)) {
-      return lexical;
+    if (!existsSync(p)) {
+      return false;
     }
-    const rc = realpathSync(c);
     const rp = realpathSync(p);
-    return rc === rp || rc.startsWith(rp + sep);
+    if (existsSync(c)) {
+      const rc = realpathSync(c);
+      return rc === rp || rc.startsWith(rp + sep);
+    }
+    // Creation path: require the nearest existing ancestor's realpath to
+    // stay inside the parent, then a `..`-free lexical suffix (M10).
+    let cursor = dirname(c);
+    while (!existsSync(cursor)) {
+      const next = dirname(cursor);
+      if (next === cursor) {
+        return false;
+      }
+      cursor = next;
+    }
+    const ra = realpathSync(cursor);
+    if (!(ra === rp || ra.startsWith(rp + sep))) {
+      return false;
+    }
+    const rel = c.slice(cursor.length);
+    return !rel.split(sep).includes('..');
   } catch {
     return false;
   }
