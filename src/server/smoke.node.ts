@@ -13,37 +13,23 @@
  * 5. WS: ipc invoke for themeSetting returns default value
  */
 
+// Must precede every import that can reach libsignal's native addon: tsx makes
+// node-gyp-build resolve prebuilds from the cwd (EXTRACTION.md).
+import './prebuilds.node.ts';
+
 import http from 'node:http';
 import os from 'node:os';
 import { join, resolve as resolvePath } from 'node:path';
 import {
   existsSync,
-  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
   statSync,
   symlinkSync,
-  unlinkSync,
   writeFileSync,
 } from 'node:fs';
-
-// tsx can make node-gyp-build resolve prebuilds from cwd (EXTRACTION.md).
-{
-  const prebuilds = join(process.cwd(), 'prebuilds');
-  const target = join(process.cwd(), 'node_modules/@signalapp/libsignal-client/prebuilds');
-  try {
-    if (existsSync(prebuilds) && lstatSync(prebuilds).isSymbolicLink() && !existsSync(prebuilds)) {
-      unlinkSync(prebuilds);
-    }
-    if (!existsSync(prebuilds) && existsSync(target)) {
-      symlinkSync(target, prebuilds);
-    }
-  } catch {
-    /* best-effort */
-  }
-}
 import { spawnSync } from 'node:child_process';
 import { encode as msgpackEncode, decode as msgpackDecode } from '@msgpack/msgpack';
 import WebSocket from 'ws';
@@ -652,6 +638,7 @@ async function runSmoke(): Promise<void> {
       },
       storageServiceKey: 'ssk-secret',
       linkedPayload: { password: 'p-secret' },
+      syncedContacts: [],
       deviceName: 'web',
       registrationIds: { aci: 1, pni: 2 },
       linkedAt: 't',
@@ -730,7 +717,10 @@ async function runSmoke(): Promise<void> {
     const parsed = parseRange('bytes=-4', 10);
     assert(parsed != null && parsed !== 'unsatisfiable' && parsed.start === 6 && parsed.end === 9, JSON.stringify(parsed));
     const coerced = safeContentType('text/html');
-    assert(coerced.contentType === 'application/octet-stream' && coerced.attachmentDisposition);
+    assert(
+      coerced.contentType === 'application/octet-stream' && coerced.attachmentDisposition,
+      JSON.stringify(coerced)
+    );
   });
 
   await test('M2: fs readFile cap; openRead still works', async () => {
