@@ -178,7 +178,10 @@ mediaCameraPermissions: false
 - `get-media-access-status` → `'denied'`
 - `DebugLogs.getLogs` → stub string
 - `crash-reports:get-count` → `0`
-- `sql-channel:remove-db` → calls `closeSQL()`
+- `sql-channel:remove-db` → `removeSQL()` (worker `removeDB` + delete key/sqlite) then
+  empties attachment/temp trees; subsequent SQL calls fail with
+  `SQL restart required after remove-db` and `/api/health` is 503
+  (`ready: false`, `sql: restart-required`) until process restart
 
 ### Unsupported (throws SignalWebUnsupportedIpc)
 - `DebugLogs.upload`
@@ -215,5 +218,24 @@ to match the relative URL `../node_modules/...` in compiled CSS.
 ---
 
 ## Protocol Extension
-No gaps in `protocol.std.ts` required extension. The `ipc-send` namespace is
-handled as fire-and-forget in the WS router (no response frame sent).
+No gaps in `protocol.std.ts` required extension. Fire-and-forget sends use
+`t: 'req'` with `ns: 'ipc-send'` (see `BridgeClient.send`). The server handles
+that namespace in `handleRequest` and does not send a response frame. There is
+no `t: 'ipc-send'` frame type on the wire.
+
+## Attachment decrypt / fs.readFile caps (M2)
+
+- Decrypted plaintext cache: **64 MB** total, 2-minute TTL, single-entry cap
+  32 MB. Video seeking still hits the cache (no re-decrypt per range).
+- Decrypt-to-memory cap: **64 MB** plaintext (`size` query); larger → HTTP 413.
+- `fs readFile` cap: **16 MB** (override `SIGNAL_FS_READFILE_MAX`); larger files
+  must use `openRead` / `read` / `closeRead`.
+
+Trade-off: large media cannot be decrypted in one shot (no seeking streaming
+decryptor). Operators who need bigger clips raise the cap and accept RAM use.
+
+## Nest (H4)
+
+Nest remains **disabled** unless `SIGNAL_NEST_API_BASE` (or `NEST_API_BASE`) is
+set. The browser client never reads `?apiBase=` and does not persist
+`password` / `storageServiceKey` in `localStorage`.

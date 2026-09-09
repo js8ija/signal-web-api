@@ -77,13 +77,13 @@ import { isFsInside } from './paths.node.ts';
  * (path, key, size) always decrypts to identical bytes, so caching by that key
  * is safe. Bounded by total bytes so memory stays in check.
  */
-const DECRYPT_CACHE_MAX_BYTES = 384 * 1024 * 1024;
+/** 64 MB decrypt/cache budget (M2). Video seeking still hits the cache. */
+export const DECRYPT_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+export const DECRYPT_MAX_PLAINTEXT_BYTES = 64 * 1024 * 1024;
 const decryptCache = new LRUCache<string, Buffer>({
   maxSize: DECRYPT_CACHE_MAX_BYTES,
   sizeCalculation: buf => Math.max(1, buf.length),
-  ttl: 10 * 60 * 1000,
-  // Don't cache anything larger than half the budget (huge single files would
-  // thrash the cache); those fall back to decrypt-per-request.
+  ttl: 2 * 60 * 1000,
   maxEntrySize: DECRYPT_CACHE_MAX_BYTES / 2,
 });
 
@@ -124,31 +124,70 @@ function sendError(
   res.end(message);
 }
 
-function safeContentType(raw: string | null): string {
+export type AttachmentContentType = {
+  contentType: string;
+  attachmentDisposition: boolean;
+};
+
+export function safeContentType(raw: string | null): AttachmentContentType {
   if (raw == null) {
-    return 'application/octet-stream';
+    return { contentType: 'application/octet-stream', attachmentDisposition: false };
   }
   const value = raw.trim();
+  const base = value.split(';', 1)[0]!.trim().toLowerCase();
   if (
     value.length === 0 ||
     value.length > 128 ||
     /[\r\n]/.test(value) ||
-    !/^[a-zA-Z0-9][a-zA-Z0-9!#$&^_.+-]*\/[a-zA-Z0-9][a-zA-Z0-9!#$&^_.+-]*$/.test(
-      value.split(';', 1)[0]!.trim()
-    )
+    !/^[a-zA-Z0-9][a-zA-Z0-9!#$&^_.+-]*\/[a-zA-Z0-9][a-zA-Z0-9!#$&^_.+-]*$/.test(base)
   ) {
-    return 'application/octet-stream';
+    return { contentType: 'application/octet-stream', attachmentDisposition: true };
   }
-  return value.split(';', 1)[0]!.trim();
+  if (
+    base === 'application/octet-stream' ||
+    base.startsWith('image/') ||
+    base.startsWith('video/') ||
+    base.startsWith('audio/')
+  ) {
+    return { contentType: base, attachmentDisposition: false };
+  }
+  return { contentType: 'application/octet-stream', attachmentDisposition: true };
 }
 
-/** Parse a Chromium-style open-ended range header: "bytes=START-" or "bytes=START-END". */
-function parseRange(
+function attachmentHeaders(
+  contentType: string,
+  forceAttachment: boolean
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Content-Type': contentType,
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'private, no-cache',
+    'X-Content-Type-Options': 'nosniff',
+    'Content-Security-Policy': "default-src 'none'; sandbox",
+  };
+  if (forceAttachment) {
+    headers['Content-Disposition'] = 'attachment';
+  }
+  return headers;
+}
+
+export type ParsedRange = { start: number; end: number } | 'unsatisfiable' | null;
+
+/** Parse RFC 9110 byte ranges, including suffix `bytes=-N`. */
+export function parseRange(
   header: string | undefined,
   totalSize: number
-): { start: number; end: number } | null {
+): ParsedRange {
   if (header == null) {
     return null;
+  }
+  const suffix = header.match(/^bytes=-(\d+)$/);
+  if (suffix) {
+    const n = Number.parseInt(suffix[1]!, 10);
+    if (!Number.isFinite(n) || n === 0 || totalSize === 0) {
+      return 'unsatisfiable';
+    }
+    return { start: Math.max(0, totalSize - n), end: totalSize - 1 };
   }
   const match = header.match(/^bytes=(\d+)-(\d*)$/);
   if (match == null || match[1] == null) {
@@ -158,16 +197,26 @@ function parseRange(
   if (!Number.isFinite(start) || start < 0) {
     return null;
   }
+  if (start >= totalSize) {
+    return 'unsatisfiable';
+  }
   let end = match[2] ? Number.parseInt(match[2], 10) : totalSize - 1;
   if (!Number.isFinite(end)) {
     end = totalSize - 1;
   }
-  // Clamp to file bounds.
   end = Math.min(end, totalSize - 1);
   if (start > end) {
-    return null;
+    return 'unsatisfiable';
   }
   return { start, end };
+}
+
+function sendUnsatisfiable(res: ServerResponse, totalSize: number): void {
+  res.writeHead(416, {
+    'Content-Range': `bytes */${totalSize}`,
+    'Content-Type': 'text/plain; charset=utf-8',
+  });
+  res.end('Range Not Satisfiable');
 }
 
 /** Decrypt a v2 attachment fully into memory, trimmed to `size` bytes. */
@@ -198,7 +247,8 @@ async function servePlaintext(
   req: IncomingMessage,
   res: ServerResponse,
   filePath: string,
-  contentType: string
+  contentType: string,
+  forceAttachment: boolean
 ): Promise<void> {
   let totalSize: number;
   try {
@@ -209,14 +259,13 @@ async function servePlaintext(
     return;
   }
 
-  const baseHeaders: Record<string, string> = {
-    'Content-Type': contentType,
-    'Accept-Ranges': 'bytes',
-    'Cache-Control': 'private, no-cache',
-    'X-Content-Type-Options': 'nosniff',
-  };
+  const baseHeaders = attachmentHeaders(contentType, forceAttachment);
 
   const range = parseRange(req.headers.range, totalSize);
+  if (range === 'unsatisfiable') {
+    sendUnsatisfiable(res, totalSize);
+    return;
+  }
 
   if (req.method === 'HEAD') {
     res.writeHead(200, { ...baseHeaders, 'Content-Length': String(totalSize) });
@@ -257,15 +306,11 @@ function serveBuffer(
   req: IncomingMessage,
   res: ServerResponse,
   buffer: Buffer,
-  contentType: string
+  contentType: string,
+  forceAttachment: boolean
 ): void {
   const totalSize = buffer.length;
-  const baseHeaders: Record<string, string> = {
-    'Content-Type': contentType,
-    'Accept-Ranges': 'bytes',
-    'Cache-Control': 'private, no-cache',
-    'X-Content-Type-Options': 'nosniff',
-  };
+  const baseHeaders = attachmentHeaders(contentType, forceAttachment);
 
   if (req.method === 'HEAD') {
     res.writeHead(200, { ...baseHeaders, 'Content-Length': String(totalSize) });
@@ -274,6 +319,10 @@ function serveBuffer(
   }
 
   const range = parseRange(req.headers.range, totalSize);
+  if (range === 'unsatisfiable') {
+    sendUnsatisfiable(res, totalSize);
+    return;
+  }
   if (range == null) {
     res.writeHead(200, { ...baseHeaders, 'Content-Length': String(totalSize) });
     res.end(buffer);
@@ -362,12 +411,13 @@ export async function handleAttachmentRequest(
       return;
     }
 
-    // Content-Type from query param — reject header-injecting values.
-    const contentType = safeContentType(url.searchParams.get('contentType'));
+    const { contentType, attachmentDisposition } = safeContentType(
+      url.searchParams.get('contentType')
+    );
 
     // ---- v1: plaintext ----
     if (version === 'v1') {
-      await servePlaintext(req, res, filePath, contentType);
+      await servePlaintext(req, res, filePath, contentType, attachmentDisposition);
       return;
     }
 
@@ -381,6 +431,10 @@ export async function handleAttachmentRequest(
     const size = sizeParam != null ? Number.parseInt(sizeParam, 10) : NaN;
     if (!Number.isFinite(size)) {
       sendError(res, 400, 'Missing/invalid size');
+      return;
+    }
+    if (size > DECRYPT_MAX_PLAINTEXT_BYTES) {
+      sendError(res, 413, 'Attachment exceeds decrypt cap');
       return;
     }
 
@@ -421,7 +475,7 @@ export async function handleAttachmentRequest(
       }
     }
 
-    serveBuffer(req, res, buffer, contentType);
+    serveBuffer(req, res, buffer, contentType, attachmentDisposition);
   } catch (error) {
     console.error('[attachment] unexpected error:', error);
     sendError(res, 500, 'Internal Server Error');

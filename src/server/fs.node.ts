@@ -20,6 +20,8 @@ import {
   existsSync,
   createWriteStream,
   createReadStream,
+  statSync,
+  rmSync,
 } from 'node:fs';
 import {
   mkdir,
@@ -31,13 +33,20 @@ import {
   writeFile,
   truncate,
 } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import type { ReadStream, WriteStream } from 'node:fs';
 import { isFsInside } from './paths.node.ts';
+import { API_TOKEN_FILENAME } from './access-control.node.ts';
+import { INSTANCE_LOCK_FILENAME } from './instance-lock.node.ts';
+
+export function getFsReadFileMaxBytes(): number {
+  const n = parseInt(process.env.SIGNAL_FS_READFILE_MAX ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : 16 * 1024 * 1024;
+}
 
 // Must match app/attachments.node.ts (the dirs the renderer actually writes
 // to via ts/util/basePaths.preload.ts), which use the `.noindex` suffix.
-const ATTACHMENT_DIRS = [
+export const ATTACHMENT_DIRS = [
   'attachments.noindex',
   'attachments.noindex/attachment-downloads',
   'temp',
@@ -77,8 +86,58 @@ export function initFs(dataDir: string): void {
   _dataDir = dataDir;
   _dataDirResolved = resolve(dataDir);
   for (const dir of ATTACHMENT_DIRS) {
-    mkdirSync(join(dataDir, dir), { recursive: true });
+    mkdirSync(join(dataDir, dir), { recursive: true, mode: 0o700 });
   }
+}
+
+/** Empty attachment/temp trees after sql-channel:remove-db (H1). */
+export function wipeUserMedia(): void {
+  if (!_dataDir) {
+    return;
+  }
+  for (const dir of ATTACHMENT_DIRS) {
+    const path = join(_dataDir, dir);
+    try {
+      rmSync(path, { recursive: true, force: true });
+    } catch {
+      /* ok */
+    }
+    mkdirSync(path, { recursive: true, mode: 0o700 });
+  }
+}
+
+const DENY_TOP = new Set([
+  'config.json',
+  'settings.json',
+  API_TOKEN_FILENAME,
+  INSTANCE_LOCK_FILENAME,
+  'db',
+]);
+
+function posixMode(mode: number): string {
+  return (mode & 0o777).toString(8).padStart(3, '0');
+}
+
+export function warnIfDataDirPermissive(dataDir: string): void {
+  if (process.platform === 'win32') {
+    return;
+  }
+  try {
+    const st = statSync(dataDir);
+    if ((st.mode & 0o077) !== 0) {
+      console.warn(
+        `[server] data dir ${dataDir} is group/other-readable (mode ${posixMode(st.mode)}); not changing user data`
+      );
+    }
+  } catch {
+    /* missing */
+  }
+}
+
+function forbiddenError(): Error {
+  const err = new Error('fs: path is not allowed');
+  err.name = 'SignalWebFsForbidden';
+  return err;
 }
 
 function unsupportedError(method: string): Error {
@@ -96,16 +155,32 @@ function warnOnce(method: string): void {
 
 const ALLOWED_WRITE_FLAGS = new Set(['w', 'wx', 'a', 'ax', 'r+', 'w+', 'a+']);
 
-/** Confine a renderer-supplied path to the data dir. */
+function isAllowlistedResolved(resolved: string): boolean {
+  const rel = relative(_dataDirResolved, resolved);
+  if (rel === '' || rel.startsWith(`..${sep}`) || rel === '..') {
+    return false;
+  }
+  const top = rel.split(sep)[0] ?? '';
+  if (DENY_TOP.has(top)) {
+    return false;
+  }
+  for (const dir of ATTACHMENT_DIRS) {
+    const allowed = resolve(_dataDirResolved, dir);
+    if (resolved === allowed || resolved.startsWith(allowed + sep)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Confine a renderer-supplied path to attachment/temp trees (C3). */
 function safePath(input: unknown): string {
   if (typeof input !== 'string' || input.length === 0 || input.includes('\0')) {
     throw unsupportedError('fs: missing path');
   }
   const resolved = resolve(input);
-  if (!isFsInside(resolved, _dataDirResolved, true)) {
-    const err = new Error(`fs: path escapes data dir: ${input}`);
-    err.name = 'SignalWebFsForbidden';
-    throw err;
+  if (!isFsInside(resolved, _dataDirResolved, true) || !isAllowlistedResolved(resolved)) {
+    throw forbiddenError();
   }
   return resolved;
 }
@@ -189,8 +264,19 @@ export async function handleFsCall(
     case 'truncate':
       await truncate(safePath(args[0]), Number(args[1] ?? 0));
       return undefined;
-    case 'readFile':
-      return new Uint8Array(await readFile(safePath(args[0])));
+    case 'readFile': {
+      const path = safePath(args[0]);
+      const s = await stat(path);
+      const cap = getFsReadFileMaxBytes();
+      if (s.size > cap) {
+        const err = new Error(
+          `fs: readFile exceeds cap of ${cap} bytes; use openRead/read/closeRead`
+        );
+        err.name = 'SignalWebFsTooLarge';
+        throw err;
+      }
+      return new Uint8Array(await readFile(path));
+    }
     case 'writeFile':
       await mkdir(dirname(safePath(args[0])), { recursive: true });
       await writeFile(safePath(args[0]), toBuffer(args[1]));

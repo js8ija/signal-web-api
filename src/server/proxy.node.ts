@@ -74,6 +74,25 @@ const HOP_BY_HOP = new Set([
   'content-length',
 ]);
 
+const PROXY_REQ_ALLOWLIST = new Set([
+  'accept',
+  'accept-language',
+  'content-type',
+  'range',
+  'user-agent',
+]);
+
+const PROXY_RES_DROP = new Set([
+  ...HOP_BY_HOP,
+  'content-encoding',
+  'set-cookie',
+  'set-cookie2',
+]);
+
+export function isProxyRequestHeaderAllowed(name: string): boolean {
+  return PROXY_REQ_ALLOWLIST.has(name.toLowerCase());
+}
+
 export async function handleProxyRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -97,7 +116,7 @@ export async function handleProxyRequest(
   const headers: Record<string, string> = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const lower = key.toLowerCase();
-    if (HOP_BY_HOP.has(lower) || value == null) {
+    if (!PROXY_REQ_ALLOWLIST.has(lower) || value == null) {
       continue;
     }
     headers[lower] = Array.isArray(value) ? value.join(', ') : value;
@@ -115,11 +134,12 @@ export async function handleProxyRequest(
 
     const responseHeaders: Record<string, string> = {};
     for (const [key, value] of Object.entries(upstream.headers)) {
-      if (!HOP_BY_HOP.has(key) && key !== 'content-encoding') {
+      if (!PROXY_RES_DROP.has(key.toLowerCase())) {
         responseHeaders[key] = value;
       }
     }
     responseHeaders['content-length'] = String(upstream.body.length);
+    responseHeaders['x-content-type-options'] = 'nosniff';
     res.writeHead(upstream.status, responseHeaders);
     res.end(upstream.body);
   } catch (error) {

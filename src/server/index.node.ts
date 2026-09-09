@@ -15,18 +15,23 @@
  *                         bundles are not mounted (API-only).
  *   SIGNAL_ENV            production | staging | development (default production)
  *   SIGNAL_WEB_LOCALE     Default locale hint (default 'en')
- *   SIGNAL_CORS_ORIGIN    CORS Allow-Origin (default *)
+ *   SIGNAL_CORS_ORIGIN    Extra CORS origins (default: loopback, never *)
+ *   SIGNAL_API_AUTH       Token auth (default on). Set `off` to disable.
+ *   SIGNAL_API_TOKEN      Optional 64-hex token instead of a random mint
+ *   SIGNAL_ALLOWED_HOSTS  Extra Host allowlist entries
  *   SIGNAL_NEST_API_BASE  LeanScrm Nest base (e.g. http://127.0.0.1:3010);
  *                         enables /api/nest reverse proxy + /api/nest-config
+ *   SIGNAL_ACCESS_LOG     Set `1` for one structured line per HTTP/WS session
  */
 
 import http from 'node:http';
+import { createReadStream, readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, extname, resolve } from 'node:path';
-import { readFileSync, existsSync, statSync, mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { encode as msgpackEncode, decode as msgpackDecode } from '@msgpack/msgpack';
 import { WebSocketServer } from 'ws';
 import type WebSocket from 'ws';
+import { stat as statAsync } from 'node:fs/promises';
 
 import type {
   RequestFrame,
@@ -37,10 +42,17 @@ import type {
 } from '../bridge/protocol.std.ts';
 import { toWireError } from '../bridge/protocol.std.ts';
 import { buildBootPayload } from './boot.node.ts';
-import { initializeSQL, sqlCall, closeSQL } from './sql.node.ts';
-import { invokeNative, releaseHandles, handleCallbackResponse, initNative } from './native.node.ts';
+import { initializeSQL, sqlCall, closeSQL, getSqlHealth, removeSQL } from './sql.node.ts';
+import {
+  invokeNative,
+  releaseHandles,
+  handleCallbackResponse,
+  initNative,
+  isNativeReady,
+  setNativeManifestAllowlist,
+} from './native.node.ts';
 import { initIpc, handleIpcInvoke, warnSendOnce, setRemoveDbFn } from './ipc.node.ts';
-import { initFs, handleFsCall } from './fs.node.ts';
+import { initFs, handleFsCall, wipeUserMedia, warnIfDataDirPermissive } from './fs.node.ts';
 import { initAttachments, handleAttachmentRequest } from './attachments.node.ts';
 import { initOptionalResources } from './optionalResources.node.ts';
 import { handleProxyRequest } from './proxy.node.ts';
@@ -55,7 +67,8 @@ import {
   getStaticRoot,
   getSignalEnv,
   getLocaleHint,
-  getCorsOrigin,
+  getEffectivePort,
+  setBoundPort,
   nativeManifestPath,
   nativeManifestFallbackPath,
   isFsInside,
@@ -67,18 +80,60 @@ import {
   MAX_BODY_NATIVE_SYNC,
   MAX_BODY_PROXY,
 } from './http-util.node.ts';
+import {
+  evaluateHttpApiAccess,
+  evaluateWsUpgrade,
+  getAllowedOrigins,
+  isApiAuthEnabled,
+  mintApiToken,
+  selectWsProtocol,
+  sendAccessDenied,
+  warnIfExposedWithoutAuth,
+} from './access-control.node.ts';
+import { acquireDataDirLock, releaseDataDirLock } from './instance-lock.node.ts';
+import { getBuildExpiration } from './boot.node.ts';
 
 // ---- configuration -----------------------------------------------------------
 
 // Identifies this server process; the native handle registry is reset on
 // restart, so the browser reloads when it sees a new id (see protocol).
 const SERVER_SESSION_ID = randomUUID();
+let _pkgVersion: string | undefined;
 function getPkgVersion(): string {
-  try {
-    return (JSON.parse(readFileSync(join(getAssetsRoot(), 'package.json'), 'utf-8')) as { version: string }).version;
-  } catch {
-    return '0.0.0';
+  if (_pkgVersion != null) {
+    return _pkgVersion;
   }
+  try {
+    _pkgVersion = (JSON.parse(readFileSync(join(getAssetsRoot(), 'package.json'), 'utf-8')) as { version: string }).version;
+  } catch {
+    _pkgVersion = '0.0.0';
+  }
+  return _pkgVersion;
+}
+
+const MAX_WS_CONNECTIONS = (() => {
+  const n = parseInt(process.env.SIGNAL_WS_MAX_CONNECTIONS ?? '32', 10);
+  return Number.isFinite(n) && n > 0 ? n : 32;
+})();
+const MAX_WS_INFLIGHT = (() => {
+  const n = parseInt(process.env.SIGNAL_WS_MAX_INFLIGHT ?? '64', 10);
+  return Number.isFinite(n) && n > 0 ? n : 64;
+})();
+const WS_PING_MS = (() => {
+  const n = parseInt(process.env.SIGNAL_WS_PING_MS ?? '30000', 10);
+  return Number.isFinite(n) && n >= 1000 ? n : 30_000;
+})();
+
+function accessLogEnabled(): boolean {
+  const raw = process.env.SIGNAL_ACCESS_LOG?.trim();
+  return raw === '1' || raw === 'true';
+}
+
+function logAccess(rec: Record<string, unknown>): void {
+  if (!accessLogEnabled()) {
+    return;
+  }
+  console.log(JSON.stringify({ ns: 'access', t: Date.now(), ...rec }));
 }
 
 // The bridge must survive stray failures from native callbacks, dropped
@@ -105,6 +160,8 @@ const MIME: Record<string, string> = {
   '.mp3': 'audio/mpeg',
   '.ogg': 'audio/ogg',
   '.wav': 'audio/wav',
+  '.wasm': 'application/wasm',
+  '.map': 'application/json',
 };
 
 function getMime(filepath: string): string {
@@ -136,7 +193,32 @@ function getStaticMounts(): Array<{ prefix: string; root: string }> {
   ];
 }
 
-function serveStaticFile(urlPath: string, res: http.ServerResponse): boolean {
+function decodeStaticRelPath(relPath: string): string | 'forbidden' {
+  const raw = relPath.startsWith('/') ? relPath.slice(1) : relPath;
+  let segments: string[];
+  try {
+    segments = raw
+      .split('/')
+      .filter(seg => seg.length > 0)
+      .map(seg => decodeURIComponent(seg));
+  } catch {
+    return 'forbidden';
+  }
+  if (segments.some(seg => seg === '.' || seg === '..' || seg.includes('\0'))) {
+    return 'forbidden';
+  }
+  return segments.join('/') || 'index.html';
+}
+
+function staticEtag(st: { size: number; mtimeMs: number }): string {
+  return `"${st.size.toString(16)}-${Math.trunc(st.mtimeMs).toString(16)}"`;
+}
+
+async function serveStaticFile(
+  urlPath: string,
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+): Promise<boolean> {
   for (const mount of getStaticMounts()) {
     const isRootMount = mount.prefix === '/';
     if (
@@ -149,34 +231,60 @@ function serveStaticFile(urlPath: string, res: http.ServerResponse): boolean {
           ? '/index.html'
           : urlPath
         : urlPath.slice(mount.prefix.length) || '/index.html';
-      const candidate = resolve(mount.root, '.' + relPath);
+      const decoded = decodeStaticRelPath(relPath);
+      if (decoded === 'forbidden') {
+        res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Forbidden');
+        return true;
+      }
+      const candidate = resolve(mount.root, decoded);
       const mountRoot = resolve(mount.root);
       if (!isFsInside(candidate, mountRoot, true) && candidate !== mountRoot) {
         continue;
       }
-      if (existsSync(candidate) && statSync(candidate).isFile()) {
-        const contentType = getMime(candidate);
-        let content: Buffer = readFileSync(candidate);
-        // Rewrite asset:/// → / in CSS files so font/image URLs resolve in browser
-        if (extname(candidate).toLowerCase() === '.css') {
-          content = Buffer.from(content.toString('utf-8').replaceAll('asset:///', '/'), 'utf-8');
-        }
-        // App code and the shell must always revalidate (dynamic imports
-        // bypass hard-reload cache busting); immutable-ish assets may cache.
-        const isAppCode =
-          urlPath.startsWith('/bundles-web/') ||
-          urlPath === '/' ||
-          urlPath.endsWith('.html') ||
-          urlPath === '/sw.js' ||
-          extname(candidate).toLowerCase() === '.css';
-        res.writeHead(200, {
-          'Content-Type': contentType,
-          'Cache-Control': isAppCode ? 'no-cache' : 'public, max-age=3600',
-          'X-Content-Type-Options': 'nosniff',
-        });
+      let st;
+      try {
+        st = await statAsync(candidate);
+      } catch {
+        continue;
+      }
+      if (!st.isFile()) {
+        continue;
+      }
+      const contentType = getMime(candidate);
+      const etag = staticEtag(st);
+      const isAppCode =
+        urlPath.startsWith('/bundles-web/') ||
+        urlPath === '/' ||
+        urlPath.endsWith('.html') ||
+        urlPath === '/sw.js' ||
+        extname(candidate).toLowerCase() === '.css';
+      const headers: Record<string, string> = {
+        'Content-Type': contentType,
+        'Cache-Control': isAppCode ? 'no-cache' : 'public, max-age=3600',
+        'X-Content-Type-Options': 'nosniff',
+        ETag: etag,
+        'Last-Modified': st.mtime.toUTCString(),
+      };
+      const inm = req.headers['if-none-match'];
+      if (inm === etag) {
+        res.writeHead(304, headers);
+        res.end();
+        return true;
+      }
+      if (extname(candidate).toLowerCase() === '.css') {
+        // CSS asset:// rewrite needs the full text; stylesheets stay small.
+        let content = readFileSync(candidate);
+        content = Buffer.from(content.toString('utf-8').replaceAll('asset:///', '/'), 'utf-8');
+        headers['Content-Length'] = String(content.length);
+        res.writeHead(200, headers);
         res.end(content);
         return true;
       }
+      headers['Content-Length'] = String(st.size);
+      res.writeHead(200, headers);
+      createReadStream(candidate).pipe(res);
+      return true;
     }
   }
   return false;
@@ -208,6 +316,7 @@ function getBootPayload(): ReturnType<typeof buildBootPayload> & {
 type SessionState = {
   ws: WebSocket;
   pendingCallbacks: Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>;
+  inflight: number;
 };
 
 function sendFrame(session: SessionState, frame: object): void {
@@ -280,14 +389,28 @@ function handleMessage(session: SessionState, data: Buffer | ArrayBuffer | Buffe
   }
 
   if (frame.t === 'req') {
-    void handleRequest(session, frame);
+    if (session.inflight >= MAX_WS_INFLIGHT) {
+      sendResponse(
+        session,
+        frame.id,
+        false,
+        undefined,
+        toWireError(
+          Object.assign(new Error(`too many in-flight requests (max ${MAX_WS_INFLIGHT})`), {
+            name: 'SignalWebTooManyRequests',
+          })
+        )
+      );
+      return;
+    }
+    session.inflight += 1;
+    void handleRequest(session, frame).finally(() => {
+      session.inflight -= 1;
+    });
   } else if (frame.t === 'cbres') {
     handleCallbackResponse(frame as CallbackResponseFrame, session.pendingCallbacks);
   } else if (frame.t === 'release') {
     releaseHandles((frame as ReleaseFrame).handles);
-  } else if (frame.t === 'ipc-send') {
-    // ipc-send is a fire-and-forget request frame variant
-    void handleRequest(session, frame as unknown as RequestFrame);
   } else {
     console.warn('[ws] Unexpected frame type:', (frame as { t: string }).t);
   }
@@ -299,24 +422,60 @@ async function handleHttpRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse
 ): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://${getListenHost()}:${getPort()}`);
+  const started = Date.now();
+  const url = new URL(req.url ?? '/', `http://${getListenHost()}:${getEffectivePort()}`);
   const pathname = url.pathname;
+  const safePath = pathname.startsWith('/api/attachment/') ? '/api/attachment' : pathname;
 
-  applyCors(res);
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204); res.end(); return;
+  applyCors(req, res);
+
+  const access = evaluateHttpApiAccess(req, pathname);
+  if (!access.ok) {
+    sendAccessDenied(res, access);
+    logAccess({
+      kind: 'http',
+      method: req.method,
+      path: safePath,
+      status: access.status,
+      ms: Date.now() - started,
+      origin: req.headers.origin ?? null,
+    });
+    return;
   }
 
-  if (req.method === 'GET' && (pathname === '/api/health' || pathname === '/healthz')) {
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204); res.end();
+    logAccess({ kind: 'http', method: 'OPTIONS', path: safePath, status: 204, ms: Date.now() - started });
+    return;
+  }
+
+  if (req.method === 'GET' && pathname === '/healthz') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-cache' });
-    res.end(
-      JSON.stringify({
-        ok: true,
-        version: getPkgVersion(),
-        serverSessionId: SERVER_SESSION_ID,
-        cors: getCorsOrigin(),
-      })
-    );
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  if (req.method === 'GET' && pathname === '/api/health') {
+    const sql = getSqlHealth();
+    const expiration = getBuildExpiration();
+    const expired = expiration > 0 && Date.now() > expiration;
+    const ready = sql.ready && isNativeReady();
+    const body = {
+      ok: ready,
+      ready,
+      sql: sql.ready ? 'ok' : (sql.reason ?? 'not-ready'),
+      native: isNativeReady(),
+      buildExpiration: expiration || undefined,
+      expired,
+      version: getPkgVersion(),
+      serverSessionId: SERVER_SESSION_ID,
+    };
+    res.writeHead(ready ? 200 : 503, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-cache',
+    });
+    res.end(JSON.stringify(body));
+    logAccess({ kind: 'http', method: 'GET', path: pathname, status: ready ? 200 : 503, ms: Date.now() - started });
     return;
   }
 
@@ -324,18 +483,32 @@ async function handleHttpRequest(
   if (req.method === 'GET' && pathname === '/api/boot') {
     const payload = getBootPayload();
     const accept = req.headers.accept ?? '';
+    const headers = { 'Cache-Control': 'no-store' };
     if (accept.includes('msgpack') || accept.includes('application/octet-stream')) {
-      res.writeHead(200, { 'Content-Type': 'application/msgpack' });
+      res.writeHead(200, { ...headers, 'Content-Type': 'application/msgpack' });
       res.end(Buffer.from(msgpackEncode(payload, { ignoreUndefined: true, useBigInt64: true })));
     } else {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.writeHead(200, { ...headers, 'Content-Type': 'application/json' });
       res.end(JSON.stringify(payload));
     }
+    logAccess({ kind: 'http', method: 'GET', path: pathname, status: 200, ms: Date.now() - started });
+    return;
+  }
+
+  if (pathname === '/api/bridge/sync' && req.method !== 'POST') {
+    res.writeHead(405, { 'Content-Type': 'text/plain; charset=utf-8', Allow: 'POST' });
+    res.end('Method Not Allowed');
     return;
   }
 
   // POST /api/bridge/sync — synchronous native calls
   if (req.method === 'POST' && pathname === '/api/bridge/sync') {
+    const ct = (req.headers['content-type'] ?? '').split(';')[0]!.trim().toLowerCase();
+    if (ct !== 'application/x-msgpack' && ct !== 'application/msgpack') {
+      res.writeHead(415, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Unsupported Media Type: expected application/x-msgpack');
+      return;
+    }
     let body: Buffer;
     try {
       body = await readBody(req, MAX_BODY_NATIVE_SYNC);
@@ -425,18 +598,39 @@ async function handleHttpRequest(
 
   // Static file serving
   if (req.method === 'GET') {
-    if (serveStaticFile(pathname, res)) return;
+    if (await serveStaticFile(pathname, req, res)) {
+      logAccess({ kind: 'http', method: 'GET', path: safePath, status: res.statusCode ?? 200, ms: Date.now() - started });
+      return;
+    }
   }
 
   res.writeHead(404, { 'Content-Type': 'text/plain' });
   res.end('Not Found');
+  logAccess({ kind: 'http', method: req.method, path: safePath, status: 404, ms: Date.now() - started });
 }
 
 // ---- server startup ---------------------------------------------------------
 
+let httpServer: http.Server | null = null;
+let wsServer: WebSocketServer | null = null;
+let wsHeartbeat: NodeJS.Timeout | null = null;
+
 export async function startServer(): Promise<http.Server> {
   const dataDir = getDataDir();
-  mkdirSync(dataDir, { recursive: true });
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  acquireDataDirLock(dataDir);
+  try {
+    return await startServerLocked(dataDir);
+  } catch (error) {
+    releaseDataDirLock();
+    throw error;
+  }
+}
+
+async function startServerLocked(dataDir: string): Promise<http.Server> {
+  warnIfDataDirPermissive(dataDir);
+  mintApiToken(dataDir);
+  warnIfExposedWithoutAuth();
 
   // Init subsystems
   initIpc(dataDir);
@@ -456,13 +650,16 @@ export async function startServer(): Promise<http.Server> {
         functions: Record<string, 'sync' | 'async'>;
       };
       _nativeManifest = m.functions;
+      setNativeManifestAllowlist(Object.keys(m.functions));
     } catch { /* ignore */ }
   }
 
-  // Wire sql-channel:remove-db to the sql layer
-  setRemoveDbFn(closeSQL);
+  setRemoveDbFn(async () => {
+    await removeSQL(dataDir);
+    wipeUserMedia();
+  });
 
-  // Build and cache boot payload
+  // Build and cache boot payload (fails closed on invalid config)
   getBootPayload();
 
   // Create HTTP server
@@ -474,19 +671,45 @@ export async function startServer(): Promise<http.Server> {
       }
     });
   });
+  server.requestTimeout = 60_000;
+  server.headersTimeout = 30_000;
+  server.keepAliveTimeout = 5_000;
+  httpServer = server;
 
   // WebSocket server
   const wss = new WebSocketServer({
     server,
     path: '/api/bridge',
     maxPayload: 16 * 1024 * 1024,
+    verifyClient: (info, done) => {
+      if (wss.clients.size >= MAX_WS_CONNECTIONS) {
+        done(false, 503, 'Too Many Connections');
+        return;
+      }
+      const decision = evaluateWsUpgrade(info.req);
+      if (!decision.ok) {
+        done(false, decision.status, decision.message);
+        return;
+      }
+      done(true);
+    },
+    handleProtocols: (protocols) => selectWsProtocol(protocols),
   });
-  wss.on('connection', (ws: WebSocket) => {
+  wsServer = wss;
+  wss.on('connection', (ws: WebSocket, req) => {
     const session: SessionState = {
       ws,
       pendingCallbacks: new Map(),
+      inflight: 0,
     };
+    (ws as WebSocket & { isAlive?: boolean }).isAlive = true;
     registerSession(ws);
+    logAccess({
+      kind: 'ws',
+      event: 'open',
+      origin: req.headers.origin ?? null,
+      host: req.headers.host ?? null,
+    });
     // Announce this server's session id first so the browser can detect a
     // restart (stale native handles) and reload before issuing native calls.
     ws.send(
@@ -497,6 +720,10 @@ export async function startServer(): Promise<http.Server> {
     );
     sendInitialPushes(ws);
 
+    ws.on('pong', () => {
+      (ws as WebSocket & { isAlive?: boolean }).isAlive = true;
+    });
+
     ws.on('message', (data) => {
       handleMessage(session, data as Buffer);
     });
@@ -506,13 +733,29 @@ export async function startServer(): Promise<http.Server> {
     });
 
     ws.on('close', () => {
-      // pendingCallbacks cleanup
+      logAccess({ kind: 'ws', event: 'close' });
       for (const [, entry] of session.pendingCallbacks) {
         entry.reject(new Error('WebSocket closed'));
       }
       session.pendingCallbacks.clear();
     });
   });
+
+  if (wsHeartbeat) {
+    clearInterval(wsHeartbeat);
+  }
+  wsHeartbeat = setInterval(() => {
+    for (const client of wss.clients) {
+      const tagged = client as WebSocket & { isAlive?: boolean };
+      if (tagged.isAlive === false) {
+        client.terminate();
+        continue;
+      }
+      tagged.isAlive = false;
+      client.ping();
+    }
+  }, WS_PING_MS);
+  wsHeartbeat.unref();
 
   return new Promise((resolve, reject) => {
     const port = getPort();
@@ -525,12 +768,14 @@ export async function startServer(): Promise<http.Server> {
       server.off('error', onError);
       const addr = server.address();
       const actualPort = typeof addr === 'object' && addr ? addr.port : port;
+      setBoundPort(actualPort);
       console.log(`Signal Web bridge listening on http://${host}:${actualPort}`);
       console.log(`  Data dir: ${dataDir}`);
       console.log(`  Assets root: ${getAssetsRoot()}`);
       console.log(`  Static UI: ${getStaticRoot() ?? '(disabled — set STATIC_ROOT to enable)'}`);
       console.log(`  Env: ${getSignalEnv()}`);
-      console.log(`  CORS origin: ${getCorsOrigin()}`);
+      console.log(`  CORS origins: ${getAllowedOrigins().join(', ')}`);
+      console.log(`  API auth: ${isApiAuthEnabled() ? 'on (token in data dir /api-token)' : 'off'}`);
       const nestBase = nestApiBaseFromEnv();
       if (nestBase) {
         console.log(`  Nest proxy: /api/nest → ${nestBase}`);
@@ -566,11 +811,50 @@ if (isLaunchedAsServerEntry()) {
       return;
     }
     shuttingDown = true;
-    console.log(`\n[server] ${signal} received, closing database…`);
-    closeSQL()
-      .catch(err => console.error('[server] sql close failed:', err))
-      .finally(() => process.exit(0));
+    console.log(`\n[server] ${signal} received, closing…`);
+    const force = setTimeout(() => process.exit(1), 8_000);
+    force.unref();
+    if (wsHeartbeat) {
+      clearInterval(wsHeartbeat);
+      wsHeartbeat = null;
+    }
+    const wss = wsServer;
+    const srv = httpServer;
+    const closeHttp = (): Promise<void> =>
+      new Promise(resolve => {
+        if (!srv) {
+          resolve();
+          return;
+        }
+        srv.close(() => resolve());
+      });
+    const closeWs = (): Promise<void> =>
+      new Promise(resolve => {
+        if (!wss) {
+          resolve();
+          return;
+        }
+        for (const client of wss.clients) {
+          client.close(1001, 'server shutting down');
+        }
+        wss.close(() => resolve());
+      });
+    Promise.all([closeWs(), closeHttp()])
+      .then(() => closeSQL())
+      .then(() => {
+        releaseDataDirLock();
+        process.exit(0);
+      })
+      .catch(err => {
+        console.error('[server] shutdown failed:', err);
+        releaseDataDirLock();
+        process.exit(1);
+      });
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
+
+process.on('exit', () => {
+  releaseDataDirLock();
+});

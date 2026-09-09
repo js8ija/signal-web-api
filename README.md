@@ -35,7 +35,11 @@ npm start   # http://127.0.0.1:8915
 
 Smoke (needs native modules + SQL worker): `npm run smoke`
 
-The process binds **127.0.0.1** by default. Set `SIGNAL_LISTEN_HOST=0.0.0.0` only if you intentionally expose the unauthenticated SQL/native bridge.
+The process binds **127.0.0.1** by default. Token auth is **on** by default
+(see `SIGNAL_API_AUTH` / `<dataDir>/api-token`). Set
+`SIGNAL_LISTEN_HOST=0.0.0.0` only if you intentionally expose the bridge, and
+**keep auth on** — `0.0.0.0` with `SIGNAL_API_AUTH=off` is a loud startup
+warning and an open SQL/native/fs surface.
 
 ## Environment
 
@@ -49,8 +53,13 @@ The process binds **127.0.0.1** by default. Set `SIGNAL_LISTEN_HOST=0.0.0.0` onl
 | `STATIC_ROOT` | *(unset)* | Desktop UI static root; if unset, API-only |
 | `SIGNAL_ENV` | `production` | Merges `config/<env>.json` (+ `local-<env>.json`) |
 | `SIGNAL_WEB_LOCALE` | `en` | Locale hint for `/api/boot` |
-| `SIGNAL_CORS_ORIGIN` | `*` | CORS `Access-Control-Allow-Origin` (pairing / cross-origin UI) |
+| `SIGNAL_CORS_ORIGIN` | loopback origins | Extra CORS origins (comma-separated). Default is `http://127.0.0.1:<port>` (+ localhost / `[::1]`). Never `*` |
+| `SIGNAL_ALLOWED_HOSTS` | loopback `host:port` | Extra `Host` header allowlist entries |
+| `SIGNAL_API_AUTH` | on | Set `off` to disable the API token (local pairing while the UI is updated) |
+| `SIGNAL_API_TOKEN` | *(minted)* | Optional 64-hex token; otherwise written to `<dataDir>/api-token` (mode `0600`) |
 | `SIGNAL_NEST_API_BASE` | *(unset)* | Optional LeanScrm Nest reverse proxy; disabled when unset |
+| `SIGNAL_ALLOW_INVALID_CONFIG` | *(unset)* | Set `1` to serve a boot config that fails `rendererConfigSchema` |
+| `SIGNAL_ACCESS_LOG` | *(unset)* | Set `1` for one structured line per HTTP request / WS session |
 | `SIGNAL_WEB_TRACE` | *(unset)* | Verbose native / attachment logging |
 
 ## Layout
@@ -63,10 +72,11 @@ The process binds **127.0.0.1** by default. Set `SIGNAL_LISTEN_HOST=0.0.0.0` onl
 
 ## API surface
 
-- `GET /api/health` - liveness (`{ ok, version, serverSessionId }`)
-- `GET /api/boot` - renderer config + locale + native manifest
-- `WS /api/bridge` - sql / ipc / native / fs (msgpack)
-- `POST /api/bridge/sync` - sync native calls
+- `GET /api/health` - readiness (`{ ok, ready, sql, native, buildExpiration }`; 503 when SQL/native not ready). Requires the API token when auth is on
+- `GET /healthz` - unauthenticated liveness
+- `GET /api/boot` - renderer config + locale + native manifest (`Cache-Control: no-store`)
+- `WS /api/bridge` - sql / ipc / native / fs (msgpack). Token via `Authorization`, `?token=`, or `Sec-WebSocket-Protocol`
+- `POST /api/bridge/sync` - sync native calls (`Content-Type: application/x-msgpack`)
 - `GET /api/attachment/v{1,2}/...` - decrypt + serve attachments
 - `GET /api/proxy?url=...` - allowlisted CORS forwarder (Signal hosts, HTTPS)
 - `GET /api/nest-config` - Nest proxy config (`enabled: false` unless env is set)
@@ -77,4 +87,14 @@ Point `STATIC_ROOT` at a full ochen1-signal-web tree to serve Desktop UI static 
 
 Same-origin: set `STATIC_ROOT` to a signal-web (or ochen1) checkout that has `web/static` + `bundles-web`.
 
-Cross-origin: UI uses `?apiOrigin=` / `__SIGNAL_WEB_API_ORIGIN__` / meta `signal-web-api-origin` (see signal-web `web/bridge/origin.web.ts`). HTTP routes send `Access-Control-Allow-Origin: *` by default (`SIGNAL_CORS_ORIGIN` to lock down). Combined with the loopback bind, this is for local pairing — do not expose the process on a public interface.
+Cross-origin: UI uses `?apiOrigin=` / `__SIGNAL_WEB_API_ORIGIN__` / meta `signal-web-api-origin` (see signal-web `web/bridge/origin.web.ts`). Put the extra UI origin in `SIGNAL_CORS_ORIGIN`. The page must present the API token (`Authorization: Bearer`, `?token=`, `Sec-WebSocket-Protocol`, or `window.__SIGNAL_WEB_API_TOKEN__`). `SIGNAL_API_AUTH=off` keeps older pairing working while the UI is updated.
+
+### API token
+
+At startup the server writes 32 random bytes (hex) to `<SIGNAL_DATA_DIR>/api-token` (mode `0600`) and logs the value once. Send it on every `/api/*` call and on the WebSocket upgrade. `Host` must be `127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>`, or a value in `SIGNAL_ALLOWED_HOSTS`. Browser `Origin` must be absent (non-browser) or one of the loopback / configured origins.
+
+`SIGNAL_LISTEN_HOST=0.0.0.0` requires auth on.
+
+### Regenerating `config/local-<env>.json`
+
+`buildCreation` / `buildExpiration` live in `config/local-production.json` (and `local-<SIGNAL_ENV>.json`). Upstream Desktop refreshes them with `pnpm run get-expire-time`. For this seed, rewrite those two millisecond timestamps (expiration should be ~60 days after creation) and restart; `/api/health` reports `buildExpiration` / `expired`. The renderer hard-stops after expiry.

@@ -11,13 +11,82 @@
  * package precedence). rendererConfigSchema is validated before returning.
  */
 
-import { readFileSync, existsSync } from 'node:fs';
+import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import os from 'node:os';
 
 import { rendererConfigSchema } from '../../vendor/ts/types/RendererConfig.std.ts';
 import type { BootPayload } from '../bridge/protocol.std.ts';
 import { getAssetsRoot } from './paths.node.ts';
+
+const EXPIRY_WARN_MS = 14 * 24 * 60 * 60 * 1000;
+let lastBuildExpiration = 0;
+
+export function getBuildExpiration(): number {
+  return lastBuildExpiration;
+}
+
+export function listAvailableSignalEnvs(repoRoot = getAssetsRoot()): string[] {
+  const dir = join(repoRoot, 'config');
+  try {
+    return readdirSync(dir)
+      .filter(name => name.endsWith('.json') && !name.startsWith('local-') && name !== 'default.json')
+      .map(name => name.slice(0, -'.json'.length))
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+export function assertSignalEnvConfigExists(env: string, repoRoot = getAssetsRoot()): string {
+  const envCfgPath = join(repoRoot, 'config', `${env}.json`);
+  if (!existsSync(envCfgPath)) {
+    const available = listAvailableSignalEnvs(repoRoot);
+    throw new Error(
+      `Missing config/${env}.json for SIGNAL_ENV=${env}. Available environments: ${
+        available.length > 0 ? available.join(', ') : '(none)'
+      }`
+    );
+  }
+  return envCfgPath;
+}
+
+/** Strip userinfo from a proxy URL so credentials never enter /api/boot (H2). */
+export function stripProxyUserinfo(raw: string): string {
+  try {
+    const u = new URL(raw);
+    if (u.username || u.password) {
+      u.username = '';
+      u.password = '';
+    }
+    return u.href;
+  } catch {
+    return raw;
+  }
+}
+
+export function allowInvalidRendererConfig(): boolean {
+  const raw = process.env.SIGNAL_ALLOW_INVALID_CONFIG?.trim();
+  return raw === '1' || raw === 'true';
+}
+
+export function logBuildExpiration(expirationMs: number): void {
+  if (!Number.isFinite(expirationMs) || expirationMs <= 0) {
+    console.warn('[boot] buildExpiration is missing or zero');
+    return;
+  }
+  const when = new Date(expirationMs).toISOString();
+  const remaining = expirationMs - Date.now();
+  if (remaining <= 0) {
+    console.warn(`[boot] buildExpiration ${when} is in the past — renderer will hard-stop`);
+  } else if (remaining <= EXPIRY_WARN_MS) {
+    console.warn(
+      `[boot] buildExpiration ${when} is within ${Math.ceil(remaining / 86400000)} days`
+    );
+  } else {
+    console.log(`[boot] buildExpiration ${when}`);
+  }
+}
 
 // ---- helpers -----------------------------------------------------------------
 
@@ -154,14 +223,16 @@ export function buildBootPayload(opts: BootOptions): BootPayload {
   const defaultCfg = readJson<Record<string, unknown>>(
     join(repoRoot, 'config', 'default.json')
   );
+  const envCfgPath = assertSignalEnvConfigExists(env, repoRoot);
   let envCfg: Record<string, unknown> = {};
-  const envCfgPath = join(repoRoot, 'config', `${env}.json`);
-  if (existsSync(envCfgPath)) {
-    try {
-      envCfg = readJson<Record<string, unknown>>(envCfgPath);
-    } catch {
-      console.warn(`[boot] Could not read config/${env}.json`);
-    }
+  try {
+    envCfg = readJson<Record<string, unknown>>(envCfgPath);
+  } catch (error) {
+    throw new Error(
+      `[boot] Could not read config/${env}.json: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
   }
   let cfg = deepMerge(defaultCfg, envCfg);
 
@@ -251,13 +322,13 @@ export function buildBootPayload(opts: BootOptions): BootPayload {
     disableIPv6: false,
     disableScreenSecurity: false,
     nodeVersion: process.versions.node,
-    hostname: os.hostname(),
+    hostname: 'localhost',
     osRelease: os.release(),
     osVersion: os.version(),
     // Optional string fields: use undefined to omit (msgpack would encode undefined as null which fails schema)
     ...(process.env.NODE_APP_INSTANCE ? { appInstance: process.env.NODE_APP_INSTANCE } : {}),
     ...((process.env.HTTPS_PROXY || process.env.https_proxy)
-      ? { proxyUrl: (process.env.HTTPS_PROXY || process.env.https_proxy) as string }
+      ? { proxyUrl: stripProxyUserinfo((process.env.HTTPS_PROXY || process.env.https_proxy) as string) }
       : {}),
     contentProxyUrl: getConfigValue<string>(cfg, 'contentProxyUrl') ?? 'http://contentproxy.signal.org:443',
     sfuUrl: getConfigValue<string>(cfg, 'sfuUrl') ?? 'https://sfu.voip.signal.org/',
@@ -272,7 +343,7 @@ export function buildBootPayload(opts: BootOptions): BootPayload {
     appStartInitialSpellcheckSetting: false,
 
     crashDumpsPath: join(dataDir, 'crashDumps'),
-    homePath: os.homedir(),
+    homePath: '/home/user',
     installPath: repoRoot,
     userDataPath: dataDir,
 
@@ -284,13 +355,21 @@ export function buildBootPayload(opts: BootOptions): BootPayload {
     argv: '[]',
   };
 
+  lastBuildExpiration = Number(rawConfig.buildExpiration) || 0;
+  logBuildExpiration(lastBuildExpiration);
+  console.log(
+    `[boot] endpoints serverUrl=${String(rawConfig.serverUrl)} storageUrl=${String(rawConfig.storageUrl)} directoryUrl=${directoryUrl}`
+  );
+
   // Validate against schema
   const parsed = rendererConfigSchema.safeParse(rawConfig);
   if (!parsed.success) {
-    console.error('[boot] rendererConfigSchema validation errors:', JSON.stringify(parsed.error.flatten(), null, 2));
-    // Still return the raw config — the schema may be stricter than what we have
-    // in the dev environment (e.g. empty certificateAuthority in non-prod).
-    // The browser side can handle partial config.
+    const flat = JSON.stringify(parsed.error.flatten(), null, 2);
+    console.error('[boot] rendererConfigSchema validation errors:', flat);
+    if (!allowInvalidRendererConfig()) {
+      throw new Error(`rendererConfigSchema validation failed:\n${flat}`);
+    }
+    console.warn('[boot] SIGNAL_ALLOW_INVALID_CONFIG set — serving invalid config');
   }
 
   // Strip undefined values — msgpack encodes undefined as null which breaks schema validation

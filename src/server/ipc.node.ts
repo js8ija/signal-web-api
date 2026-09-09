@@ -13,8 +13,10 @@
  * Unknown ipc-send channels are swallowed (logged once).
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
+
+export const SETTINGS_VALUE_MAX_BYTES = 64 * 1024;
 import type { MenuOptionsType } from '../../vendor/ts/types/menu.std.ts';
 import { getOptionalResource } from './optionalResources.node.ts';
 
@@ -68,8 +70,16 @@ function loadSettings(): Record<string, unknown> {
 function saveSettings(): void {
   if (_settingsCache == null) return;
   const path = join(_dataDir, 'settings.json');
-  mkdirSync(_dataDir, { recursive: true });
-  writeFileSync(path, JSON.stringify(_settingsCache, null, 2), 'utf-8');
+  mkdirSync(_dataDir, { recursive: true, mode: 0o700 });
+  const body = JSON.stringify(_settingsCache, null, 2);
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, body, { encoding: 'utf-8', mode: 0o600 });
+  renameSync(tmp, path);
+  try {
+    chmodSync(path, 0o600);
+  } catch {
+    /* best-effort */
+  }
 }
 
 // Sensible defaults for settings
@@ -169,6 +179,20 @@ export async function handleIpcInvoke(
       });
     }
     const value = args[0];
+    let encoded: string;
+    try {
+      encoded = JSON.stringify(value) ?? 'null';
+    } catch {
+      throw Object.assign(new Error('settings value is not serializable'), {
+        name: 'SignalWebUnsupportedIpc',
+      });
+    }
+    if (encoded.length > SETTINGS_VALUE_MAX_BYTES) {
+      throw Object.assign(
+        new Error(`settings value exceeds ${SETTINGS_VALUE_MAX_BYTES} bytes`),
+        { name: 'SignalWebUnsupportedIpc' }
+      );
+    }
     const settings = loadSettings();
     settings[name] = value;
     saveSettings();

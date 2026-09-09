@@ -1014,3 +1014,11 @@ re-reported:
   confinement, and which must keep passing.
 - **No default-behaviour changes beyond access control.** Ports, data-dir
   layout, disposition→dir mapping and the loopback bind stay as they are.
+
+---
+
+## SKIPPED
+
+| ID | Reason |
+| -- | ------ |
+| M3 | Per-session native/fs handle registries need threading session ids through `invokeNative` / `handleFsCall` and a sync-path scope. Not a small localized change; left for a follow-up so C1–C3 / H1–H5 stay reviewable. |

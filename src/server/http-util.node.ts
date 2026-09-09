@@ -2,23 +2,28 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { getCorsOrigin } from './paths.node.ts';
+import { defaultCorsOrigin, isOriginAllowed } from './access-control.node.ts';
 
 export const MAX_BODY_NATIVE_SYNC = 2 * 1024 * 1024;
 export const MAX_BODY_PROXY = 32 * 1024 * 1024;
 export const MAX_BODY_NEST = 8 * 1024 * 1024;
 
-export function applyCors(res: ServerResponse): void {
-  const origin = getCorsOrigin();
-  res.setHeader('Access-Control-Allow-Origin', origin);
+export function applyCors(req: IncomingMessage, res: ServerResponse): void {
+  const requestOrigin = Array.isArray(req.headers.origin)
+    ? req.headers.origin[0]
+    : req.headers.origin;
+  const origin = requestOrigin?.trim();
+  if (origin && isOriginAllowed(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  } else if (!origin) {
+    res.setHeader('Access-Control-Allow-Origin', defaultCorsOrigin());
+  }
+  res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS');
   res.setHeader(
     'Access-Control-Allow-Headers',
     'Content-Type, Accept, Authorization'
   );
-  if (origin !== '*') {
-    res.setHeader('Vary', 'Origin');
-  }
 }
 
 export function readBody(

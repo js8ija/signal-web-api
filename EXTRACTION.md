@@ -112,3 +112,8 @@ AGPL-3.0-only; see LICENSE.
 - Bind defaults to 127.0.0.1 (`SIGNAL_LISTEN_HOST` to override)
 - Nest reverse proxy is **off** unless `SIGNAL_NEST_API_BASE` / `NEST_API_BASE` is set
 - Path/env helpers in `src/server/paths.node.ts` are lazy (safe to set env before `startServer()`)
+- API token at `<SIGNAL_DATA_DIR>/api-token` (mode `0600`); opt out with `SIGNAL_API_AUTH=off`
+- `SIGNAL_LISTEN_HOST=0.0.0.0` requires auth on
+- CORS default is loopback origins, never `*`
+- SQL worker still `require()`s `@signalapp/ringrtc` at load time even though calling is stubbed; a missing/unloadable module fails startup with Node version + ABI
+- `@signalapp/sqlcipher` is likewise a load-time worker dependency

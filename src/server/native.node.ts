@@ -90,6 +90,15 @@ export function getRegistrySize(): number {
 let Native: Record<string, unknown> = {};
 let _nativeReady = false;
 let _nativeReadyPromise: Promise<void> | null = null;
+let _manifestAllow: Set<string> | null = null;
+
+export function setNativeManifestAllowlist(names: Iterable<string>): void {
+  _manifestAllow = new Set(names);
+}
+
+export function isNativeReady(): boolean {
+  return _nativeReady;
+}
 
 export function initNative(): Promise<void> {
   if (_nativeReadyPromise) return _nativeReadyPromise;
@@ -347,6 +356,16 @@ export async function invokeNative(
   // Special bootstrap functions — no-op if already done at startup
   if (method === 'registerErrors' || method === 'initLogger') {
     return undefined;
+  }
+
+  if (
+    _manifestAllow != null &&
+    _manifestAllow.size > 0 &&
+    !_manifestAllow.has(method) &&
+    method !== 'registerErrors' &&
+    method !== 'initLogger'
+  ) {
+    throw new Error(`Unknown native function: ${method}`);
   }
 
   const fn = Native[method];
