@@ -8,6 +8,7 @@
  */
 
 import type http from 'node:http';
+import { isIP } from 'node:net';
 import { signalFetch } from './signalFetch.node.ts';
 
 const ALLOWED_HOST_SUFFIXES = [
@@ -16,9 +17,9 @@ const ALLOWED_HOST_SUFFIXES = [
   '.signalcaptchas.org',
 ];
 
-const ALLOWED_HOSTS = new Set(['signal.org']);
+const ALLOWED_METHODS = new Set(['GET', 'HEAD', 'POST']);
 
-function isAllowedUrl(raw: string): URL | undefined {
+export function isAllowedProxyUrl(raw: string): URL | undefined {
   let url: URL;
   try {
     url = new URL(raw);
@@ -28,14 +29,32 @@ function isAllowedUrl(raw: string): URL | undefined {
   if (url.protocol !== 'https:') {
     return undefined;
   }
-  const host = url.hostname.toLowerCase();
-  if (ALLOWED_HOSTS.has(host)) {
-    return url;
+  if (url.username || url.password) {
+    return undefined;
   }
-  if (ALLOWED_HOST_SUFFIXES.some(suffix => host.endsWith(suffix))) {
-    return url;
+  const port = url.port;
+  if (port && port !== '443') {
+    return undefined;
   }
-  return undefined;
+  const host = url.hostname.toLowerCase().replace(/\.$/, '');
+  if (!host || isIP(host) !== 0) {
+    return undefined;
+  }
+  if (!isAllowedProxyHost(host)) {
+    return undefined;
+  }
+  return url;
+}
+
+export function isAllowedProxyHost(host: string): boolean {
+  const h = host.toLowerCase().replace(/\.$/, '');
+  for (const suffix of ALLOWED_HOST_SUFFIXES) {
+    const base = suffix.startsWith('.') ? suffix.slice(1) : suffix;
+    if (h === base || h.endsWith('.' + base)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 const HOP_BY_HOP = new Set([
@@ -52,6 +71,7 @@ const HOP_BY_HOP = new Set([
   'referer',
   'cookie',
   'accept-encoding',
+  'content-length',
 ]);
 
 export async function handleProxyRequest(
@@ -60,7 +80,14 @@ export async function handleProxyRequest(
   rawUrl: string,
   body: Buffer
 ): Promise<void> {
-  const target = isAllowedUrl(rawUrl);
+  const method = (req.method ?? 'GET').toUpperCase();
+  if (!ALLOWED_METHODS.has(method)) {
+    res.writeHead(405, { 'content-type': 'text/plain' });
+    res.end('proxy: method not allowed');
+    return;
+  }
+
+  const target = isAllowedProxyUrl(rawUrl);
   if (target == null) {
     res.writeHead(403, { 'content-type': 'text/plain' });
     res.end('proxy: host not allowed');
@@ -78,17 +105,17 @@ export async function handleProxyRequest(
 
   try {
     const upstream = await signalFetch(target, {
-      method: req.method ?? 'GET',
+      method,
       headers,
       body:
-        req.method === 'GET' || req.method === 'HEAD' || body.length === 0
+        method === 'GET' || method === 'HEAD' || body.length === 0
           ? undefined
           : body,
     });
 
     const responseHeaders: Record<string, string> = {};
     for (const [key, value] of Object.entries(upstream.headers)) {
-      if (!HOP_BY_HOP.has(key) && key !== 'content-encoding' && key !== 'content-length') {
+      if (!HOP_BY_HOP.has(key) && key !== 'content-encoding') {
         responseHeaders[key] = value;
       }
     }

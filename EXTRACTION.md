@@ -94,9 +94,9 @@ Shared resolver: src/server/paths.node.ts.
 ## Remaining blockers
 
 - Full Desktop UI not shipped
-- Native module install / rebuild required
+- Native module install / rebuild required (`@signalapp/libsignal-client`, `@signalapp/sqlcipher`, `@signalapp/ringrtc`)
 - Optional resources CDN needs network
-- config/development.json not copied
+- config/development.json not copied (use `SIGNAL_ENV=production`, which is the default)
 
 ## License
 
@@ -105,4 +105,10 @@ AGPL-3.0-only; see LICENSE.
 ## Runtime notes (2026-09-08)
 - tsx can break libsignal node-gyp-build __dirname; scripts/start.mjs symlinks ./prebuilds
 - SQL worker needs bundles/chunks/* plus @signalapp/sqlcipher and @signalapp/ringrtc
-- Use Node 24.15.x
+- Use Node 24.15.x (native ABI); Node 20.19+ may work if prebuilds exist
+- `package-lock.json` must list sqlcipher + ringrtc (regenerate with `npm install` after adding them)
+
+## Runtime notes (2026-09-09)
+- Bind defaults to 127.0.0.1 (`SIGNAL_LISTEN_HOST` to override)
+- Nest reverse proxy is **off** unless `SIGNAL_NEST_API_BASE` / `NEST_API_BASE` is set
+- Path/env helpers in `src/server/paths.node.ts` are lazy (safe to set env before `startServer()`)

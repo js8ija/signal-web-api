@@ -17,7 +17,7 @@ import os from 'node:os';
 
 import { rendererConfigSchema } from '../../vendor/ts/types/RendererConfig.std.ts';
 import type { BootPayload } from '../bridge/protocol.std.ts';
-import { ASSETS_ROOT as REPO_ROOT } from './paths.node.ts';
+import { getAssetsRoot } from './paths.node.ts';
 
 // ---- helpers -----------------------------------------------------------------
 
@@ -53,18 +53,19 @@ function getConfigValue<T>(cfg: Record<string, unknown>, path: string): T {
 type LocaleMessages = Record<string, { messageformat?: string | undefined }>;
 
 function loadLocale(locale: string): LocaleMessages {
+  const repoRoot = getAssetsRoot();
   // Use compact-locales (packaged format)
-  const keysPath = join(REPO_ROOT, 'build', 'compact-locales', 'keys.json');
-  const enValuesPath = join(REPO_ROOT, 'build', 'compact-locales', 'en', 'values.json');
+  const keysPath = join(repoRoot, 'build', 'compact-locales', 'keys.json');
+  const enValuesPath = join(repoRoot, 'build', 'compact-locales', 'en', 'values.json');
 
   if (!existsSync(keysPath) || !existsSync(enValuesPath)) {
     // Fall back to _locales JSON
     try {
       const msgs = readJson<Record<string, { messageformat?: string }>>(
-        join(REPO_ROOT, '_locales', locale, 'messages.json')
+        join(repoRoot, '_locales', locale, 'messages.json')
       );
       const enMsgs = readJson<Record<string, { messageformat?: string }>>(
-        join(REPO_ROOT, '_locales', 'en', 'messages.json')
+        join(repoRoot, '_locales', 'en', 'messages.json')
       );
       return { ...enMsgs, ...msgs };
     } catch {
@@ -76,7 +77,7 @@ function loadLocale(locale: string): LocaleMessages {
   const enValues = readJson<(string | null)[]>(enValuesPath);
 
   let localeValues: (string | null)[] = enValues;
-  const localePath = join(REPO_ROOT, 'build', 'compact-locales', locale, 'values.json');
+  const localePath = join(repoRoot, 'build', 'compact-locales', locale, 'values.json');
   if (existsSync(localePath)) {
     try {
       localeValues = readJson<(string | null)[]>(localePath);
@@ -97,7 +98,7 @@ function loadLocale(locale: string): LocaleMessages {
 }
 
 function getAvailableLocales(): string[] {
-  const path = join(REPO_ROOT, 'build', 'available-locales.json');
+  const path = join(getAssetsRoot(), 'build', 'available-locales.json');
   if (existsSync(path)) return readJson<string[]>(path);
   return ['en'];
 }
@@ -147,13 +148,14 @@ export type BootOptions = {
 
 export function buildBootPayload(opts: BootOptions): BootPayload {
   const { env, dataDir, localeHint, nativeManifest } = opts;
+  const repoRoot = getAssetsRoot();
 
   // --- config layer merge ---
   const defaultCfg = readJson<Record<string, unknown>>(
-    join(REPO_ROOT, 'config', 'default.json')
+    join(repoRoot, 'config', 'default.json')
   );
   let envCfg: Record<string, unknown> = {};
-  const envCfgPath = join(REPO_ROOT, 'config', `${env}.json`);
+  const envCfgPath = join(repoRoot, 'config', `${env}.json`);
   if (existsSync(envCfgPath)) {
     try {
       envCfg = readJson<Record<string, unknown>>(envCfgPath);
@@ -165,7 +167,7 @@ export function buildBootPayload(opts: BootOptions): BootPayload {
 
   // local-<env>.json carries buildCreation/buildExpiration written by
   // `pnpm run get-expire-time` (same precedence as the `config` package).
-  const localCfgPath = join(REPO_ROOT, 'config', `local-${env}.json`);
+  const localCfgPath = join(repoRoot, 'config', `local-${env}.json`);
   if (existsSync(localCfgPath)) {
     try {
       cfg = deepMerge(cfg, readJson<Record<string, unknown>>(localCfgPath));
@@ -176,7 +178,7 @@ export function buildBootPayload(opts: BootOptions): BootPayload {
 
   // --- package.json ---
   const pkgJson = readJson<{ version: string; productName: string }>(
-    join(REPO_ROOT, 'package.json')
+    join(repoRoot, 'package.json')
   );
 
   // --- locale ---
@@ -191,7 +193,7 @@ export function buildBootPayload(opts: BootOptions): BootPayload {
   // locale display names
   let localeDisplayNames: unknown = {};
   try {
-    const ldnPath = join(REPO_ROOT, 'build', 'locale-display-names.json');
+    const ldnPath = join(repoRoot, 'build', 'locale-display-names.json');
     if (existsSync(ldnPath)) {
       localeDisplayNames = readJson<unknown>(ldnPath);
     }
@@ -200,7 +202,7 @@ export function buildBootPayload(opts: BootOptions): BootPayload {
   // country display names
   let countryDisplayNames: unknown = {};
   try {
-    const cdnPath = join(REPO_ROOT, 'build', 'country-display-names.json');
+    const cdnPath = join(repoRoot, 'build', 'country-display-names.json');
     if (existsSync(cdnPath)) {
       countryDisplayNames = readJson<unknown>(cdnPath);
     }
@@ -209,7 +211,7 @@ export function buildBootPayload(opts: BootOptions): BootPayload {
   // --- DNS fallback ---
   let dnsFallback: unknown[] = [];
   try {
-    const dnsPath = join(REPO_ROOT, 'build', 'dns-fallback.json');
+    const dnsPath = join(repoRoot, 'build', 'dns-fallback.json');
     if (existsSync(dnsPath)) {
       dnsFallback = readJson<unknown[]>(dnsPath);
     }
@@ -271,7 +273,7 @@ export function buildBootPayload(opts: BootOptions): BootPayload {
 
     crashDumpsPath: join(dataDir, 'crashDumps'),
     homePath: os.homedir(),
-    installPath: REPO_ROOT,
+    installPath: repoRoot,
     userDataPath: dataDir,
 
     directoryConfig: { directoryUrl, directoryMRENCLAVE },

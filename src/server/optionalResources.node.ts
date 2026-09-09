@@ -24,11 +24,12 @@ type ResourceDecl = Readonly<{
 let declarations: Record<string, ResourceDecl> | undefined;
 let resourcesDir: string | undefined;
 const memoryCache = new Map<string, Uint8Array>();
+let ready: Promise<void> = Promise.resolve();
 
 export function initOptionalResources(repoRoot: string, dataDir: string): void {
   resourcesDir = join(dataDir, 'optionalResources');
   mkdirSync(resourcesDir, { recursive: true });
-  void readFile(join(repoRoot, 'build', 'optional-resources.json'), 'utf-8')
+  ready = readFile(join(repoRoot, 'build', 'optional-resources.json'), 'utf-8')
     .then(json => {
       declarations = JSON.parse(json) as Record<string, ResourceDecl>;
     })
@@ -52,6 +53,7 @@ function isValid(data: Uint8Array, decl: ResourceDecl): boolean {
 export async function getOptionalResource(
   name: string
 ): Promise<Uint8Array | undefined> {
+  await ready;
   if (declarations == null || resourcesDir == null) {
     return undefined;
   }

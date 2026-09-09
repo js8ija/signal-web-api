@@ -60,7 +60,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
-import { join, normalize } from 'node:path';
+import { join, normalize, resolve } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { LRUCache } from 'lru-cache';
 
@@ -68,7 +68,7 @@ import {
   decryptAttachmentV2ToSink,
   type DecryptAttachmentToSinkOptionsType,
 } from '../../vendor/ts/AttachmentCrypto.node.ts';
-import { isPathInside } from '../../vendor/ts/util/isPathInside.node.ts';
+import { isFsInside } from './paths.node.ts';
 
 /**
  * Decrypted-plaintext cache. A `<video>` element seeks by issuing many small
@@ -122,6 +122,24 @@ function sendError(
   }
   res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8' });
   res.end(message);
+}
+
+function safeContentType(raw: string | null): string {
+  if (raw == null) {
+    return 'application/octet-stream';
+  }
+  const value = raw.trim();
+  if (
+    value.length === 0 ||
+    value.length > 128 ||
+    /[\r\n]/.test(value) ||
+    !/^[a-zA-Z0-9][a-zA-Z0-9!#$&^_.+-]*\/[a-zA-Z0-9][a-zA-Z0-9!#$&^_.+-]*$/.test(
+      value.split(';', 1)[0]!.trim()
+    )
+  ) {
+    return 'application/octet-stream';
+  }
+  return value.split(';', 1)[0]!.trim();
 }
 
 /** Parse a Chromium-style open-ended range header: "bytes=START-" or "bytes=START-END". */
@@ -195,6 +213,7 @@ async function servePlaintext(
     'Content-Type': contentType,
     'Accept-Ranges': 'bytes',
     'Cache-Control': 'private, no-cache',
+    'X-Content-Type-Options': 'nosniff',
   };
 
   const range = parseRange(req.headers.range, totalSize);
@@ -245,6 +264,7 @@ function serveBuffer(
     'Content-Type': contentType,
     'Accept-Ranges': 'bytes',
     'Cache-Control': 'private, no-cache',
+    'X-Content-Type-Options': 'nosniff',
   };
 
   if (req.method === 'HEAD') {
@@ -308,10 +328,20 @@ export async function handleAttachmentRequest(
     // The relative file path is URL-encoded (each segment encodeURIComponent'd
     // by the URL builder); decode each segment.
     const encodedRelPath = rest.slice(slash + 1);
-    const relSegments = encodedRelPath
-      .split('/')
-      .filter(seg => seg.length > 0)
-      .map(seg => decodeURIComponent(seg));
+    let relSegments: Array<string>;
+    try {
+      relSegments = encodedRelPath
+        .split('/')
+        .filter(seg => seg.length > 0)
+        .map(seg => decodeURIComponent(seg));
+    } catch {
+      sendError(res, 400, 'Invalid attachment path encoding');
+      return;
+    }
+    if (relSegments.some(seg => seg === '.' || seg === '..' || seg.includes('\0'))) {
+      sendError(res, 403, 'Access denied');
+      return;
+    }
 
     // Disposition → parent dir.
     const disposition = url.searchParams.get('disposition') ?? 'attachment';
@@ -324,14 +354,16 @@ export async function handleAttachmentRequest(
 
     // Resolve + confine to the parent dir.
     const filePath = normalize(join(parentDir, ...relSegments));
-    if (!isPathInside(filePath, parentDir)) {
+    if (
+      resolve(filePath) === resolve(parentDir) ||
+      !isFsInside(filePath, parentDir, true)
+    ) {
       sendError(res, 403, 'Access denied');
       return;
     }
 
-    // Content-Type from query param.
-    const contentType =
-      url.searchParams.get('contentType') ?? 'application/octet-stream';
+    // Content-Type from query param — reject header-injecting values.
+    const contentType = safeContentType(url.searchParams.get('contentType'));
 
     // ---- v1: plaintext ----
     if (version === 'v1') {

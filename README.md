@@ -21,8 +21,8 @@ Vendored TypeScript under `vendor/ts/` retains upstream copyright headers.
 
 ## Requirements
 
-- Node.js **24.15.0** (see `package.json` engines)
-- Native addon: `@signalapp/libsignal-client` (SQLCipher via the SQL worker)
+- Node.js **24.15.x recommended** (native addon ABI; `>=20.19` may work if prebuilds exist)
+- Native addons: `@signalapp/libsignal-client`, `@signalapp/sqlcipher`, `@signalapp/ringrtc`
 
 ## Quick start
 
@@ -30,23 +30,27 @@ Vendored TypeScript under `vendor/ts/` retains upstream copyright headers.
 npm install
 export SIGNAL_ASSETS_ROOT="$PWD"
 export SIGNAL_DATA_DIR="${SIGNAL_DATA_DIR:-$HOME/.signal-web}"
-npm start   # http://localhost:8915
+npm start   # http://127.0.0.1:8915
 ```
 
 Smoke (needs native modules + SQL worker): `npm run smoke`
+
+The process binds **127.0.0.1** by default. Set `SIGNAL_LISTEN_HOST=0.0.0.0` only if you intentionally expose the unauthenticated SQL/native bridge.
 
 ## Environment
 
 | Variable | Default | Purpose |
 | -------- | ------- | -------- |
 | `PORT` | `8915` | HTTP listen port |
+| `SIGNAL_LISTEN_HOST` | `127.0.0.1` | Bind address. Opt in to `0.0.0.0` to expose |
 | `SIGNAL_DATA_DIR` | `~/.signal-web` | Persistent DB / attachments / settings |
 | `SIGNAL_WEB_DATA` | (alias) | legacy alias for `SIGNAL_DATA_DIR` |
 | `SIGNAL_ASSETS_ROOT` | `process.cwd()` | Root for config/build/bundles/_locales/assets |
 | `STATIC_ROOT` | *(unset)* | Desktop UI static root; if unset, API-only |
 | `SIGNAL_ENV` | `production` | Merges `config/<env>.json` (+ `local-<env>.json`) |
 | `SIGNAL_WEB_LOCALE` | `en` | Locale hint for `/api/boot` |
-| `SIGNAL_NEST_API_BASE` \ *(unset)* | Optional LeanScrm Nest reverse proxy |
+| `SIGNAL_CORS_ORIGIN` | `*` | CORS `Access-Control-Allow-Origin` (pairing / cross-origin UI) |
+| `SIGNAL_NEST_API_BASE` | *(unset)* | Optional LeanScrm Nest reverse proxy; disabled when unset |
 | `SIGNAL_WEB_TRACE` | *(unset)* | Verbose native / attachment logging |
 
 ## Layout
@@ -59,11 +63,13 @@ Smoke (needs native modules + SQL worker): `npm run smoke`
 
 ## API surface
 
+- `GET /api/health` - liveness (`{ ok, version, serverSessionId }`)
 - `GET /api/boot` - renderer config + locale + native manifest
-- `WS /api/bridge` - sql /ipc / native / fs (msgpack)
-- `PosT /api/bridge/sync` - sync native calls
+- `WS /api/bridge` - sql / ipc / native / fs (msgpack)
+- `POST /api/bridge/sync` - sync native calls
 - `GET /api/attachment/v{1,2}/...` - decrypt + serve attachments
-- `GET /api/proxy?url=...` - allowlisted CORS forwarder
+- `GET /api/proxy?url=...` - allowlisted CORS forwarder (Signal hosts, HTTPS)
+- `GET /api/nest-config` - Nest proxy config (`enabled: false` unless env is set)
 
 Point `STATIC_ROOT` at a full ochen1-signal-web tree to serve Desktop UI static bundles.
 
@@ -71,4 +77,4 @@ Point `STATIC_ROOT` at a full ochen1-signal-web tree to serve Desktop UI static 
 
 Same-origin: set `STATIC_ROOT` to a signal-web (or ochen1) checkout that has `web/static` + `bundles-web`.
 
-Cross-origin: UI uses `?apiOrigin=` / `__SIGNAL_WEB_API_ORIGIN__` / meta `signal-web-api-origin` (see signal-web `web/bridge/origin.web.ts`). This API already sends permissive CORS on HTTP routes.
+Cross-origin: UI uses `?apiOrigin=` / `__SIGNAL_WEB_API_ORIGIN__` / meta `signal-web-api-origin` (see signal-web `web/bridge/origin.web.ts`). HTTP routes send `Access-Control-Allow-Origin: *` by default (`SIGNAL_CORS_ORIGIN` to lock down). Combined with the loopback bind, this is for local pairing — do not expose the process on a public interface.
