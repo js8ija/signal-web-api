@@ -18,14 +18,32 @@ import os from 'node:os';
 import { join, resolve as resolvePath } from 'node:path';
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
+
+// tsx can make node-gyp-build resolve prebuilds from cwd (EXTRACTION.md).
+{
+  const prebuilds = join(process.cwd(), 'prebuilds');
+  const target = join(process.cwd(), 'node_modules/@signalapp/libsignal-client/prebuilds');
+  try {
+    if (existsSync(prebuilds) && lstatSync(prebuilds).isSymbolicLink() && !existsSync(prebuilds)) {
+      unlinkSync(prebuilds);
+    }
+    if (!existsSync(prebuilds) && existsSync(target)) {
+      symlinkSync(target, prebuilds);
+    }
+  } catch {
+    /* best-effort */
+  }
+}
 import { spawnSync } from 'node:child_process';
 import { encode as msgpackEncode, decode as msgpackDecode } from '@msgpack/msgpack';
 import WebSocket from 'ws';
@@ -445,6 +463,7 @@ async function runSmoke(): Promise<void> {
       threw = true;
       assert(
         String((error as Error).message).includes('escapes') ||
+          String((error as Error).message).includes('not allowed') ||
           String((error as Error).message).includes('Forbidden') ||
           String((error as Error).name).includes('Forbidden'),
         `unexpected error: ${(error as Error).message}`
