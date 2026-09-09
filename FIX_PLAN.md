@@ -8,6 +8,9 @@ SPDX-License-Identifier: AGPL-3.0-only
 Review of `js8ija/signal-web-api` at `e6a889b` (after the harden PRs #1–#3).
 **This document is the deliverable. No code fixes are implemented in this phase.**
 
+> Phase B implemented this plan; [`VERIFY.md`](./VERIFY.md) records the Phase C
+> verification result (pass / fail / waived per item, with evidence).
+
 Every claim below was checked against the code in this repository; findings that
 turned out to be wrong are listed in [Verified and discarded](#verified-and-discarded)
 so nobody re-spends effort on them.
