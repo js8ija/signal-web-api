@@ -13,7 +13,7 @@ import https from 'node:https';
 import tls from 'node:tls';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { ASSETS_ROOT as REPO_ROOT } from './paths.node.ts';
+import { getAssetsRoot } from './paths.node.ts';
 
 let cachedCa: Array<string> | undefined;
 
@@ -24,7 +24,7 @@ function getSignalCa(): Array<string> {
   const certs: Array<string> = [...tls.rootCertificates];
   try {
     const config = JSON.parse(
-      readFileSync(join(REPO_ROOT, 'config', 'default.json'), 'utf-8')
+      readFileSync(join(getAssetsRoot(), 'config', 'default.json'), 'utf-8')
     ) as { certificateAuthority?: string };
     if (config.certificateAuthority) {
       certs.push(config.certificateAuthority);
@@ -42,6 +42,8 @@ export type SignalFetchResult = {
   body: Buffer;
 };
 
+const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024;
+
 export function signalFetch(
   url: URL,
   options: {
@@ -49,9 +51,22 @@ export function signalFetch(
     headers?: Record<string, string>;
     body?: Buffer;
     timeoutMs?: number;
+    maxBodyBytes?: number;
   } = {}
 ): Promise<SignalFetchResult> {
   return new Promise((resolve, reject) => {
+    const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
+    let settled = false;
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    const succeed = (value: SignalFetchResult): void => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
     const request = https.request(
       url,
       {
@@ -62,7 +77,18 @@ export function signalFetch(
       },
       response => {
         const chunks: Array<Buffer> = [];
-        response.on('data', chunk => chunks.push(chunk as Buffer));
+        let total = 0;
+        response.on('data', chunk => {
+          const buf = chunk as Buffer;
+          total += buf.length;
+          if (total > maxBodyBytes) {
+            request.destroy(
+              new Error(`signal-fetch: response exceeds ${maxBodyBytes} bytes for ${url.host}`)
+            );
+            return;
+          }
+          chunks.push(buf);
+        });
         response.on('end', () => {
           const headers: Record<string, string> = {};
           for (const [key, value] of Object.entries(response.headers)) {
@@ -70,19 +96,19 @@ export function signalFetch(
               headers[key] = Array.isArray(value) ? value.join(', ') : value;
             }
           }
-          resolve({
+          succeed({
             status: response.statusCode ?? 0,
             headers,
             body: Buffer.concat(chunks),
           });
         });
-        response.on('error', reject);
+        response.on('error', err => fail(err instanceof Error ? err : new Error(String(err))));
       }
     );
     request.on('timeout', () => {
       request.destroy(new Error(`signal-fetch: timeout for ${url.host}`));
     });
-    request.on('error', reject);
+    request.on('error', err => fail(err instanceof Error ? err : new Error(String(err))));
     if (options.body != null && options.body.length > 0) {
       request.end(options.body);
     } else {

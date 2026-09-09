@@ -35,18 +35,33 @@ export function initIpc(dataDir: string): void {
   _dataDir = dataDir;
 }
 
+const FORBIDDEN_SETTING_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function asDict(source: Record<string, unknown>): Record<string, unknown> {
+  const out = Object.create(null) as Record<string, unknown>;
+  for (const [key, value] of Object.entries(source)) {
+    if (FORBIDDEN_SETTING_KEYS.has(key)) {
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
 function loadSettings(): Record<string, unknown> {
   if (_settingsCache != null) return _settingsCache;
   const path = join(_dataDir, 'settings.json');
   if (existsSync(path)) {
     try {
-      _settingsCache = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>;
+      _settingsCache = asDict(
+        JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>
+      );
       return _settingsCache;
     } catch {
       // fall through
     }
   }
-  _settingsCache = {};
+  _settingsCache = Object.create(null) as Record<string, unknown>;
   return _settingsCache;
 }
 
@@ -132,17 +147,27 @@ export async function handleIpcInvoke(
   const getMatch = channel.match(/^settings:get:(.+)$/);
   if (getMatch) {
     const name = getMatch[1];
+    if (!name || FORBIDDEN_SETTING_KEYS.has(name)) {
+      return null;
+    }
     const settings = loadSettings();
     if (Object.prototype.hasOwnProperty.call(settings, name)) {
       return settings[name];
     }
-    return SETTING_DEFAULTS[name] ?? null;
+    return Object.prototype.hasOwnProperty.call(SETTING_DEFAULTS, name)
+      ? SETTING_DEFAULTS[name]
+      : null;
   }
 
   // --- settings:set:<name> ---
   const setMatch = channel.match(/^settings:set:(.+)$/);
   if (setMatch) {
     const name = setMatch[1];
+    if (!name || FORBIDDEN_SETTING_KEYS.has(name)) {
+      throw Object.assign(new Error('Invalid settings key'), {
+        name: 'SignalWebUnsupportedIpc',
+      });
+    }
     const value = args[0];
     const settings = loadSettings();
     settings[name] = value;

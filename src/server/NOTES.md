@@ -12,7 +12,7 @@
 init/read/write protocol from `main.main.ts` without the Electron dependency.
 The SQL worker binary itself has no Electron import.
 
-**Files affected**: `web/server/sql.node.ts` (standalone; no upstream files modified)
+**Files affected**: `src/server/sql.node.ts` (standalone; no upstream files modified)
 
 ---
 

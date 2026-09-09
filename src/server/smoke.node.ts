@@ -3,7 +3,7 @@
 
 /**
  * Smoke test for the Signal Web bridge server.
- * Usage: pnpm exec tsx web/server/smoke.node.ts
+ * Usage: npm run smoke
  *
  * Tests:
  * 1. GET /api/boot — config validates against rendererConfigSchema; nativeManifest has >300 entries
@@ -15,7 +15,7 @@
 
 import http from 'node:http';
 import os from 'node:os';
-import { join } from 'node:path';
+import { join, resolve as resolvePath } from 'node:path';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { encode as msgpackEncode, decode as msgpackDecode } from '@msgpack/msgpack';
 import WebSocket from 'ws';
@@ -26,8 +26,11 @@ const tmpDir = mkdtempSync(join(os.tmpdir(), 'signal-web-smoke-'));
 process.env.SIGNAL_DATA_DIR = tmpDir;
 process.env.SIGNAL_WEB_DATA = tmpDir; // legacy alias
 process.env.PORT = '0'; // random port
-process.env.SIGNAL_ENV = 'development';
+process.env.SIGNAL_ENV = 'production';
 process.env.SIGNAL_ASSETS_ROOT = process.env.SIGNAL_ASSETS_ROOT ?? process.cwd();
+process.env.SIGNAL_LISTEN_HOST = '127.0.0.1';
+delete process.env.SIGNAL_NEST_API_BASE;
+delete process.env.NEST_API_BASE;
 
 // Dynamically import server after setting env
 import type { Server as HttpServer } from 'node:http';
@@ -35,6 +38,9 @@ import { rendererConfigSchema } from '../../vendor/ts/types/RendererConfig.std.t
 import type { RequestFrame, ResponseFrame, ReleaseFrame, WireHandle } from '../bridge/protocol.std.ts';
 import { isWireHandle } from '../bridge/protocol.std.ts';
 import { closeSQL } from './sql.node.ts';
+import { isAllowedProxyUrl, isAllowedProxyHost } from './proxy.node.ts';
+import { resolveNestUpstreamUrl, nestApiBaseFromEnv } from './nest-proxy.node.ts';
+import { isFsInside, getDataDir } from './paths.node.ts';
 
 let serverInstance: HttpServer | null = null;
 let serverPort = 0;
@@ -119,8 +125,15 @@ class WsSession {
 
   async connect(): Promise<void> {
     await new Promise<void>((resolve, reject) => {
-      this.ws.on('open', resolve);
-      this.ws.on('error', reject);
+      const timer = setTimeout(() => reject(new Error('ws connect timeout')), 15_000);
+      this.ws.on('open', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      this.ws.on('error', err => {
+        clearTimeout(timer);
+        reject(err);
+      });
     });
     this.ws.on('message', (data) => {
       const frame = msgpackDecode(data as Buffer) as ResponseFrame;
@@ -139,9 +152,19 @@ class WsSession {
   async call(ns: string, method: string, args: unknown[]): Promise<unknown> {
     const id = this.seq++;
     return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`ws call timeout ${ns}:${method}`));
+      }, 20_000);
       this.pending.set(id, {
-        resolve: (f) => resolve(f.value),
-        reject,
+        resolve: (f) => {
+          clearTimeout(timer);
+          resolve(f.value);
+        },
+        reject: err => {
+          clearTimeout(timer);
+          reject(err);
+        },
       });
       const frame: RequestFrame = { t: 'req', id, ns: ns as RequestFrame['ns'], method, args };
       this.ws.send(msgpackEncode(frame));
@@ -165,8 +188,8 @@ async function runSmoke(): Promise<void> {
   const { startServer } = await import('./index.node.ts');
   serverInstance = await startServer();
   serverPort = (serverInstance.address() as { port: number }).port;
-  const base = `http://localhost:${serverPort}`;
-  const wsBase = `ws://localhost:${serverPort}`;
+  const base = `http://127.0.0.1:${serverPort}`;
+  const wsBase = `ws://127.0.0.1:${serverPort}`;
 
   console.log(`\nSmoke test running against ${base}\n`);
 
@@ -196,6 +219,12 @@ async function runSmoke(): Promise<void> {
     for (const ch of ['get-config', 'locale-data', 'locale-display-names', 'country-display-names', 'OS.getClassName', 'get-user-data-path', 'native-theme:init']) {
       assert(syncKeys.includes(ch), `Missing sync channel: ${ch}`);
     }
+
+    const dataPath = payload.sync['get-user-data-path'];
+    assert(
+      dataPath === resolvePath(tmpDir) || dataPath === getDataDir(),
+      `Smoke must not touch the real user data dir; got ${String(dataPath)} expected ${resolvePath(tmpDir)}`
+    );
   });
 
   // ---- Test 2: SQL write + read ----------------------------------------------
@@ -294,6 +323,68 @@ async function runSmoke(): Promise<void> {
       `Expected theme setting, got ${JSON.stringify(theme)}`);
 
     ws.close();
+  });
+
+  await test('GET /api/health returns ok', async () => {
+    const res = await httpGet(`${base}/api/health`);
+    assert(res.status === 200, `Expected 200, got ${res.status}`);
+    const body = JSON.parse(res.body.toString('utf-8')) as { ok: boolean };
+    assert(body.ok === true, 'health.ok should be true');
+  });
+
+  await test('proxy allowlist: apex captcha host allowed, others rejected', async () => {
+    assert(isAllowedProxyHost('signalcaptchas.org'), 'signalcaptchas.org apex must be allowed');
+    assert(isAllowedProxyHost('cdn.signal.org'), 'cdn.signal.org must be allowed');
+    assert(isAllowedProxyUrl('https://signalcaptchas.org/challenge') != null, 'https captcha URL');
+    assert(isAllowedProxyUrl('https://example.com/') == null, 'example.com must be rejected');
+    assert(isAllowedProxyUrl('http://cdn.signal.org/') == null, 'http must be rejected');
+    assert(isAllowedProxyUrl('https://evil-signal.org/') == null, 'suffix bypass must be rejected');
+    assert(isAllowedProxyUrl('https://cdn.signal.org.evil.com/') == null, 'suffix append must be rejected');
+    assert(isAllowedProxyUrl('https://user:pass@cdn.signal.org/') == null, 'userinfo must be rejected');
+    const denied = await httpGet(`${base}/api/proxy?url=${encodeURIComponent('https://example.com/')}`);
+    assert(denied.status === 403, `Expected 403, got ${denied.status}`);
+  });
+
+  await test('nest proxy disabled by default and confines upstream URL', async () => {
+    assert(nestApiBaseFromEnv() === '', 'nest proxy must be off without SIGNAL_NEST_API_BASE');
+    const cfgRes = await httpGet(`${base}/api/nest-config`);
+    assert(cfgRes.status === 200, `Expected 200, got ${cfgRes.status}`);
+    const cfg = JSON.parse(cfgRes.body.toString('utf-8')) as { enabled: boolean };
+    assert(cfg.enabled === false, 'nest-config.enabled should be false');
+    const nestRes = await httpGet(`${base}/api/nest/messages/stream`);
+    assert(nestRes.status === 503, `Expected 503, got ${nestRes.status}`);
+
+    const confined = resolveNestUpstreamUrl(
+      'http://127.0.0.1:3010',
+      '/api/nest//evil.com/steal',
+      ''
+    );
+    assert(
+      confined.origin === 'http://127.0.0.1:3010',
+      `protocol-relative suffix escaped: ${confined.href}`
+    );
+    assert(confined.pathname === '/evil.com/steal', confined.pathname);
+  });
+
+  await test('fs namespace rejects paths outside the data dir', async () => {
+    const ws = new WsSession(`${wsBase}/api/bridge`);
+    await ws.connect();
+    let threw = false;
+    try {
+      await ws.call('fs', 'readFile', ['/etc/passwd']);
+    } catch (error) {
+      threw = true;
+      assert(
+        String((error as Error).message).includes('escapes') ||
+          String((error as Error).message).includes('Forbidden') ||
+          String((error as Error).name).includes('Forbidden'),
+        `unexpected error: ${(error as Error).message}`
+      );
+    }
+    assert(threw, 'expected fs read of /etc/passwd to fail');
+    ws.close();
+    assert(isFsInside('/tmp/ui/bundles-evil/x', '/tmp/ui/bundles') === false, 'prefix bypass');
+    assert(isFsInside('/tmp/ui/bundles/x', '/tmp/ui/bundles') === true, 'descendant allowed');
   });
 
   // ---- Summary ---------------------------------------------------------------

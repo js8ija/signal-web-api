@@ -6,6 +6,7 @@
  *
  * ENV:
  *   PORT                  HTTP port (default 8915)
+ *   SIGNAL_LISTEN_HOST    Bind address (default 127.0.0.1)
  *   SIGNAL_DATA_DIR       Data directory (default ~/.signal-web)
  *                         Alias: SIGNAL_WEB_DATA (legacy)
  *   SIGNAL_ASSETS_ROOT    Assets root for config/build/bundles/_locales/assets
@@ -14,14 +15,14 @@
  *                         bundles are not mounted (API-only).
  *   SIGNAL_ENV            production | staging | development (default production)
  *   SIGNAL_WEB_LOCALE     Default locale hint (default 'en')
+ *   SIGNAL_CORS_ORIGIN    CORS Allow-Origin (default *)
  *   SIGNAL_NEST_API_BASE  LeanScrm Nest base (e.g. http://127.0.0.1:3010);
  *                         enables /api/nest reverse proxy + /api/nest-config
  */
 
 import http from 'node:http';
 import { join, extname, resolve } from 'node:path';
-import { readFileSync, existsSync, statSync } from 'node:fs';
-import { mkdirSync } from 'node:fs';
+import { readFileSync, existsSync, statSync, mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { encode as msgpackEncode, decode as msgpackDecode } from '@msgpack/msgpack';
 import { WebSocketServer } from 'ws';
@@ -44,41 +45,46 @@ import { initAttachments, handleAttachmentRequest } from './attachments.node.ts'
 import { initOptionalResources } from './optionalResources.node.ts';
 import { handleProxyRequest } from './proxy.node.ts';
 import { handleNestProxy, nestApiBaseFromEnv } from './nest-proxy.node.ts';
-import { registerSession, pushToAll, sendInitialPushes } from './push.node.ts';
+import { registerSession, sendInitialPushes } from './push.node.ts';
 import type { CallbackRequestFrame } from '../bridge/protocol.std.ts';
 import {
-  PORT,
-  DATA_DIR,
-  ASSETS_ROOT,
-  REPO_ROOT,
-  STATIC_ROOT,
-  SIGNAL_ENV,
-  LOCALE_HINT,
+  getPort,
+  getListenHost,
+  getDataDir,
+  getAssetsRoot,
+  getStaticRoot,
+  getSignalEnv,
+  getLocaleHint,
+  getCorsOrigin,
   nativeManifestPath,
   nativeManifestFallbackPath,
+  isFsInside,
 } from './paths.node.ts';
+import {
+  applyCors,
+  readBody,
+  sendPayloadTooLarge,
+  MAX_BODY_NATIVE_SYNC,
+  MAX_BODY_PROXY,
+} from './http-util.node.ts';
 
 // ---- configuration -----------------------------------------------------------
 
 // Identifies this server process; the native handle registry is reset on
 // restart, so the browser reloads when it sees a new id (see protocol).
 const SERVER_SESSION_ID = randomUUID();
-const PKG_VERSION = (() => {
+function getPkgVersion(): string {
   try {
-    return (JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf-8')) as { version: string }).version;
-  } catch { return '0.0.0'; }
-})();
-
-// Ensure data dir exists
-mkdirSync(DATA_DIR, { recursive: true });
+    return (JSON.parse(readFileSync(join(getAssetsRoot(), 'package.json'), 'utf-8')) as { version: string }).version;
+  } catch {
+    return '0.0.0';
+  }
+}
 
 // The bridge must survive stray failures from native callbacks, dropped
 // futures and background tasks — log loudly, never exit.
 process.on('unhandledRejection', reason => {
   console.error('[server] unhandled rejection (continuing):', reason);
-});
-process.on('uncaughtException', error => {
-  console.error('[server] uncaught exception (continuing):', error);
 });
 
 // ---- MIME types --------------------------------------------------------------
@@ -109,26 +115,29 @@ function getMime(filepath: string): string {
 
 // Map of URL prefix → filesystem root.
 // Desktop UI static mounts are only enabled when STATIC_ROOT is set.
-const STATIC_MOUNTS: Array<{ prefix: string; root: string }> = STATIC_ROOT
-  ? [
-      { prefix: '/bundles-web', root: join(STATIC_ROOT, 'bundles-web') },
-      { prefix: '/bundles', root: join(STATIC_ROOT, 'bundles') },
-      { prefix: '/stylesheets', root: join(STATIC_ROOT, 'stylesheets') },
-      { prefix: '/fonts', root: join(STATIC_ROOT, 'fonts') },
-      { prefix: '/images', root: join(STATIC_ROOT, 'images') },
-      { prefix: '/sounds', root: join(STATIC_ROOT, 'sounds') },
-      { prefix: '/build', root: join(STATIC_ROOT, 'build') },
-      {
-        prefix: '/node_modules/intl-tel-input/build/img',
-        root: join(STATIC_ROOT, 'node_modules', 'intl-tel-input', 'build', 'img'),
-      },
-      { prefix: '/', root: join(STATIC_ROOT, 'web', 'static') },
-    ]
-  : [];
+function getStaticMounts(): Array<{ prefix: string; root: string }> {
+  const staticRoot = getStaticRoot();
+  if (!staticRoot) {
+    return [];
+  }
+  return [
+    { prefix: '/bundles-web', root: join(staticRoot, 'bundles-web') },
+    { prefix: '/bundles', root: join(staticRoot, 'bundles') },
+    { prefix: '/stylesheets', root: join(staticRoot, 'stylesheets') },
+    { prefix: '/fonts', root: join(staticRoot, 'fonts') },
+    { prefix: '/images', root: join(staticRoot, 'images') },
+    { prefix: '/sounds', root: join(staticRoot, 'sounds') },
+    { prefix: '/build', root: join(staticRoot, 'build') },
+    {
+      prefix: '/node_modules/intl-tel-input/build/img',
+      root: join(staticRoot, 'node_modules', 'intl-tel-input', 'build', 'img'),
+    },
+    { prefix: '/', root: join(staticRoot, 'web', 'static') },
+  ];
+}
 
 function serveStaticFile(urlPath: string, res: http.ServerResponse): boolean {
-  // Prevent directory traversal
-  for (const mount of STATIC_MOUNTS) {
+  for (const mount of getStaticMounts()) {
     const isRootMount = mount.prefix === '/';
     if (
       isRootMount ||
@@ -141,8 +150,10 @@ function serveStaticFile(urlPath: string, res: http.ServerResponse): boolean {
           : urlPath
         : urlPath.slice(mount.prefix.length) || '/index.html';
       const candidate = resolve(mount.root, '.' + relPath);
-      // Security: must stay within mount root
-      if (!candidate.startsWith(resolve(mount.root))) continue;
+      const mountRoot = resolve(mount.root);
+      if (!isFsInside(candidate, mountRoot, true) && candidate !== mountRoot) {
+        continue;
+      }
       if (existsSync(candidate) && statSync(candidate).isFile()) {
         const contentType = getMime(candidate);
         let content: Buffer = readFileSync(candidate);
@@ -161,6 +172,7 @@ function serveStaticFile(urlPath: string, res: http.ServerResponse): boolean {
         res.writeHead(200, {
           'Content-Type': contentType,
           'Cache-Control': isAppCode ? 'no-cache' : 'public, max-age=3600',
+          'X-Content-Type-Options': 'nosniff',
         });
         res.end(content);
         return true;
@@ -180,26 +192,15 @@ function getBootPayload(): ReturnType<typeof buildBootPayload> & {
 } {
   if (_bootPayload == null) {
     _bootPayload = buildBootPayload({
-      env: SIGNAL_ENV,
-      dataDir: DATA_DIR,
-      localeHint: LOCALE_HINT,
+      env: getSignalEnv(),
+      dataDir: getDataDir(),
+      localeHint: getLocaleHint(),
       nativeManifest: _nativeManifest,
     });
   }
   return { ...(_bootPayload as object), serverSessionId: SERVER_SESSION_ID } as ReturnType<
     typeof buildBootPayload
   > & { serverSessionId: string };
-}
-
-// ---- body reading ------------------------------------------------------------
-
-function readBody(req: http.IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
 }
 
 // ---- WebSocket session -------------------------------------------------------
@@ -298,15 +299,25 @@ async function handleHttpRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse
 ): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://localhost:${PORT}`);
+  const url = new URL(req.url ?? '/', `http://${getListenHost()}:${getPort()}`);
   const pathname = url.pathname;
 
-  // CORS
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept');
+  applyCors(res);
   if (req.method === 'OPTIONS') {
     res.writeHead(204); res.end(); return;
+  }
+
+  if (req.method === 'GET' && (pathname === '/api/health' || pathname === '/healthz')) {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-cache' });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        version: getPkgVersion(),
+        serverSessionId: SERVER_SESSION_ID,
+        cors: getCorsOrigin(),
+      })
+    );
+    return;
   }
 
   // GET /api/boot
@@ -325,7 +336,16 @@ async function handleHttpRequest(
 
   // POST /api/bridge/sync — synchronous native calls
   if (req.method === 'POST' && pathname === '/api/bridge/sync') {
-    const body = await readBody(req);
+    let body: Buffer;
+    try {
+      body = await readBody(req, MAX_BODY_NATIVE_SYNC);
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode === 413) {
+        sendPayloadTooLarge(res);
+        return;
+      }
+      throw error;
+    }
     let reqFrame: RequestFrame;
     try {
       reqFrame = msgpackDecode(body, { useBigInt64: true }) as RequestFrame;
@@ -376,9 +396,19 @@ async function handleHttpRequest(
       res.end('proxy: missing url parameter');
       return;
     }
-    const body = req.method === 'GET' || req.method === 'HEAD'
-      ? Buffer.alloc(0)
-      : await readBody(req);
+    let body: Buffer;
+    try {
+      body =
+        req.method === 'GET' || req.method === 'HEAD'
+          ? Buffer.alloc(0)
+          : await readBody(req, MAX_BODY_PROXY);
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode === 413) {
+        sendPayloadTooLarge(res);
+        return;
+      }
+      throw error;
+    }
     await handleProxyRequest(req, res, target, body);
     return;
   }
@@ -405,13 +435,16 @@ async function handleHttpRequest(
 // ---- server startup ---------------------------------------------------------
 
 export async function startServer(): Promise<http.Server> {
+  const dataDir = getDataDir();
+  mkdirSync(dataDir, { recursive: true });
+
   // Init subsystems
-  initIpc(DATA_DIR);
-  initFs(DATA_DIR);
-  initAttachments(DATA_DIR);
-  initOptionalResources(REPO_ROOT, DATA_DIR);
+  initIpc(dataDir);
+  initFs(dataDir);
+  initAttachments(dataDir);
+  initOptionalResources(getAssetsRoot(), dataDir);
   await initNative();
-  await initializeSQL(DATA_DIR, PKG_VERSION);
+  await initializeSQL(dataDir, getPkgVersion());
 
   // Load native manifest
   const manifestPath = existsSync(nativeManifestPath())
@@ -443,7 +476,11 @@ export async function startServer(): Promise<http.Server> {
   });
 
   // WebSocket server
-  const wss = new WebSocketServer({ server, path: '/api/bridge' });
+  const wss = new WebSocketServer({
+    server,
+    path: '/api/bridge',
+    maxPayload: 16 * 1024 * 1024,
+  });
   wss.on('connection', (ws: WebSocket) => {
     const session: SessionState = {
       ws,
@@ -477,13 +514,23 @@ export async function startServer(): Promise<http.Server> {
     });
   });
 
-  return new Promise((resolve) => {
-    server.listen(PORT, () => {
-      console.log(`Signal Web bridge listening on http://localhost:${PORT}`);
-      console.log(`  Data dir: ${DATA_DIR}`);
-      console.log(`  Assets root: ${ASSETS_ROOT}`);
-      console.log(`  Static UI: ${STATIC_ROOT ?? '(disabled — set STATIC_ROOT to enable)'}`);
-      console.log(`  Env: ${SIGNAL_ENV}`);
+  return new Promise((resolve, reject) => {
+    const port = getPort();
+    const host = getListenHost();
+    const onError = (err: Error): void => {
+      reject(err);
+    };
+    server.once('error', onError);
+    server.listen(port, host, () => {
+      server.off('error', onError);
+      const addr = server.address();
+      const actualPort = typeof addr === 'object' && addr ? addr.port : port;
+      console.log(`Signal Web bridge listening on http://${host}:${actualPort}`);
+      console.log(`  Data dir: ${dataDir}`);
+      console.log(`  Assets root: ${getAssetsRoot()}`);
+      console.log(`  Static UI: ${getStaticRoot() ?? '(disabled — set STATIC_ROOT to enable)'}`);
+      console.log(`  Env: ${getSignalEnv()}`);
+      console.log(`  CORS origin: ${getCorsOrigin()}`);
       const nestBase = nestApiBaseFromEnv();
       if (nestBase) {
         console.log(`  Nest proxy: /api/nest → ${nestBase}`);
@@ -495,8 +542,17 @@ export async function startServer(): Promise<http.Server> {
   });
 }
 
+function isLaunchedAsServerEntry(): boolean {
+  if (typeof require !== 'undefined' && require.main === module) {
+    return true;
+  }
+  return process.argv.some(arg =>
+    /(?:^|[/\\])src[/\\]server[/\\]index\.node\.ts$/.test(arg)
+  );
+}
+
 // Standalone entry
-if (require.main === module || process.argv[1]?.endsWith('index.node.ts')) {
+if (isLaunchedAsServerEntry()) {
   startServer().catch(err => {
     console.error('Failed to start server:', err);
     process.exit(1);

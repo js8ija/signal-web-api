@@ -8,22 +8,46 @@
  *
  * Mount: /api/nest/*  →  ${SIGNAL_NEST_API_BASE}/*
  * Config: GET /api/nest-config
+ *
+ * Disabled unless SIGNAL_NEST_API_BASE (or NEST_API_BASE) is set.
  */
 
 import http from 'node:http';
 import https from 'node:https';
 import { URL } from 'node:url';
+import { MAX_BODY_NEST, readBody, sendPayloadTooLarge } from './http-util.node.ts';
 
 export const NEST_PROXY_PREFIX = '/api/nest';
 export const NEST_CONFIG_PATH = '/api/nest-config';
+
+const ALLOWED_METHODS = new Set([
+  'GET',
+  'HEAD',
+  'POST',
+  'PUT',
+  'PATCH',
+  'DELETE',
+  'OPTIONS',
+]);
 
 /** Upstream Nest base, e.g. http://127.0.0.1:3010. Empty = proxy disabled. */
 export function nestApiBaseFromEnv(): string {
   const raw =
     process.env.SIGNAL_NEST_API_BASE?.trim() ||
     process.env.NEST_API_BASE?.trim() ||
-    'http://127.0.0.1:3010';
-  return raw.replace(/\/$/, '');
+    '';
+  if (!raw) {
+    return '';
+  }
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      return '';
+    }
+    return raw.replace(/\/$/, '');
+  } catch {
+    return '';
+  }
 }
 
 export type NestConfigPayload = {
@@ -47,13 +71,42 @@ export function buildNestConfig(): NestConfigPayload {
   };
 }
 
-function readBody(req: http.IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
+function defaultPort(protocol: string): string {
+  return protocol === 'https:' ? '443' : '80';
+}
+
+/**
+ * Map /api/nest/<path> onto apiBase, rejecting protocol-relative / absolute
+ * suffixes that would escape the configured origin (SSRF).
+ */
+export function resolveNestUpstreamUrl(
+  apiBase: string,
+  pathname: string,
+  search: string
+): URL {
+  const base = new URL(apiBase.endsWith('/') ? apiBase : `${apiBase}/`);
+  let suffix = pathname.startsWith(NEST_PROXY_PREFIX)
+    ? pathname.slice(NEST_PROXY_PREFIX.length)
+    : pathname;
+  if (!suffix) {
+    suffix = '/';
+  }
+  if (!suffix.startsWith('/')) {
+    suffix = `/${suffix}`;
+  }
+  // Collapse leading slashes so `//evil.com` cannot become protocol-relative.
+  suffix = `/${suffix.replace(/^\/+/, '')}`;
+  const target = new URL(suffix + search, base);
+  const basePort = base.port || defaultPort(base.protocol);
+  const targetPort = target.port || defaultPort(target.protocol);
+  if (
+    target.protocol !== base.protocol ||
+    target.hostname !== base.hostname ||
+    targetPort !== basePort
+  ) {
+    throw new Error('nest-proxy: target escaped configured origin');
+  }
+  return target;
 }
 
 /**
@@ -96,32 +149,61 @@ export async function handleNestProxy(
     return true;
   }
 
-  const suffix = pathname.slice(NEST_PROXY_PREFIX.length) || '/';
-  const targetUrl = new URL(suffix + search, apiBase.endsWith('/') ? apiBase : apiBase + '/');
+  const method = (req.method ?? 'GET').toUpperCase();
+  if (!ALLOWED_METHODS.has(method)) {
+    res.writeHead(405, { 'Content-Type': 'text/plain' });
+    res.end('nest-proxy: method not allowed');
+    return true;
+  }
 
-  const body =
-    req.method === 'GET' || req.method === 'HEAD' || req.method === 'DELETE'
-      ? Buffer.alloc(0)
-      : await readBody(req);
+  let targetUrl: URL;
+  try {
+    targetUrl = resolveNestUpstreamUrl(apiBase, pathname, search);
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Invalid nest proxy path' }));
+    return true;
+  }
+
+  let body: Buffer;
+  try {
+    body =
+      method === 'GET' || method === 'HEAD' || method === 'DELETE'
+        ? Buffer.alloc(0)
+        : await readBody(req, MAX_BODY_NEST);
+  } catch (error) {
+    if ((error as { statusCode?: number }).statusCode === 413) {
+      sendPayloadTooLarge(res);
+      return true;
+    }
+    throw error;
+  }
 
   const lib = targetUrl.protocol === 'https:' ? https : http;
   const headers: http.OutgoingHttpHeaders = {
     accept: req.headers.accept ?? '*/*',
-    'content-type': req.headers['content-type'] ?? 'application/json',
     'user-agent': 'signal-web-nest-proxy/1',
   };
+  if (req.headers['content-type']) {
+    headers['content-type'] = req.headers['content-type'];
+  } else if (body.length > 0) {
+    headers['content-type'] = 'application/json';
+  }
+  if (req.headers.authorization) {
+    headers.authorization = req.headers.authorization;
+  }
   if (body.length > 0) {
     headers['content-length'] = body.length;
   }
 
-  await new Promise<void>((resolve) => {
+  await new Promise<void>(resolve => {
     const upstream = lib.request(
       {
         protocol: targetUrl.protocol,
         hostname: targetUrl.hostname,
         port: targetUrl.port,
         path: targetUrl.pathname + targetUrl.search,
-        method: req.method,
+        method,
         headers,
       },
       upstreamRes => {
@@ -130,7 +212,6 @@ export async function handleNestProxy(
         };
         const ct = upstreamRes.headers['content-type'];
         if (ct) outHeaders['content-type'] = ct;
-        // Do not forward content-length for streamed NDJSON
         res.writeHead(upstreamRes.statusCode ?? 502, outHeaders);
         upstreamRes.pipe(res);
         upstreamRes.on('end', () => resolve());

@@ -31,8 +31,9 @@ import {
   writeFile,
   truncate,
 } from 'node:fs/promises';
-import { dirname, join, resolve, sep } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import type { ReadStream, WriteStream } from 'node:fs';
+import { isFsInside } from './paths.node.ts';
 
 // Must match app/attachments.node.ts (the dirs the renderer actually writes
 // to via ts/util/basePaths.preload.ts), which use the `.noindex` suffix.
@@ -93,16 +94,15 @@ function warnOnce(method: string): void {
   }
 }
 
+const ALLOWED_WRITE_FLAGS = new Set(['w', 'wx', 'a', 'ax', 'r+', 'w+', 'a+']);
+
 /** Confine a renderer-supplied path to the data dir. */
 function safePath(input: unknown): string {
-  if (typeof input !== 'string' || input.length === 0) {
+  if (typeof input !== 'string' || input.length === 0 || input.includes('\0')) {
     throw unsupportedError('fs: missing path');
   }
   const resolved = resolve(input);
-  if (
-    resolved !== _dataDirResolved &&
-    !resolved.startsWith(_dataDirResolved + sep)
-  ) {
+  if (!isFsInside(resolved, _dataDirResolved, true)) {
     const err = new Error(`fs: path escapes data dir: ${input}`);
     err.name = 'SignalWebFsForbidden';
     throw err;
@@ -200,9 +200,13 @@ export async function handleFsCall(
     case 'openWrite': {
       const path = safePath(args[0]);
       const opts = (args[1] ?? {}) as { flags?: string; start?: number };
+      const flags = opts.flags ?? 'w';
+      if (!ALLOWED_WRITE_FLAGS.has(flags)) {
+        throw unsupportedError(`fs: invalid flags ${flags}`);
+      }
       await mkdir(dirname(path), { recursive: true });
       const stream = createWriteStream(path, {
-        flags: opts.flags ?? 'w',
+        flags,
         start: opts.start,
       });
       const id = _nextHandle++;
