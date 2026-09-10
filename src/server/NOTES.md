@@ -45,8 +45,10 @@ detected by `isRawExternal()` (null prototype, no enumerable keys).
 as `null`). `rendererConfigSchema` uses `configOptionalStringSchema` which accepts
 `string | undefined` but rejects `null`.
 
-**Workaround**: Optional config fields (`appInstance`, `proxyUrl`) are only included
-in the config object when they have a real value (via object spread). A
+**Workaround**: Optional config fields (`appInstance`) are only included
+in the config object when they have a real value (via object spread).
+`proxyUrl` remains an optional schema field but is never populated here —
+`HTTPS_PROXY` is not consumed and is not copied into `/api/boot`. A
 `stripUndefined()` pass is applied to the validated config before it enters the
 BootPayload.
 
@@ -146,6 +148,31 @@ file modified.
 
 **Files affected (electron avoidance)**: server reads attachments without
 touching `app/attachment_channel.main.ts`.
+
+---
+
+### 9. Two-layer outbound proxy
+
+**Problem**: This process has two independent network stacks. Node's
+`http.Agent` / `https.request` cannot affect the Rust sockets opened by
+`@signalapp/libsignal-client`, and libsignal's `ConnectionManager_set_proxy`
+cannot affect `/api/proxy` or the optional-resources CDN fetch. A proxy
+applied at only one layer silently leaks the other.
+
+**Workaround**: `SIGNAL_PROXY_URL` is applied at both layers. The Node layer
+passes `https-proxy-agent` or `socks-proxy-agent` into `signalFetch`
+(`https.request`) based on the URL scheme. The libsignal layer calls
+`ConnectionManager_set_proxy` immediately after `ConnectionManager_new`
+(libsignal 0.94.1 already accepts http/https/socks*). Startup fails closed
+on an invalid URL, a path/query/hash, or an unsupported scheme
+(`org.signal.tls` has no Node-side agent). If applying the libsignal proxy
+throws, the manager is marked invalid (`ConnectionManager_set_invalid_proxy`)
+rather than leaking a direct connection. While enforcement is on,
+renderer-issued `set_proxy` / `clear_proxy` are refused
+(`ConnectionManager_set_invalid_proxy` can still tighten).
+
+**Files affected**: `src/server/paths.node.ts`, `signalFetch.node.ts`,
+`native.node.ts`, `index.node.ts`.
 
 ---
 

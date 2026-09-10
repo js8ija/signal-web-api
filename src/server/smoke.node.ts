@@ -14,6 +14,7 @@
  */
 
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import { join, resolve as resolvePath } from 'node:path';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -31,6 +32,12 @@ process.env.SIGNAL_ASSETS_ROOT = process.env.SIGNAL_ASSETS_ROOT ?? process.cwd()
 process.env.SIGNAL_LISTEN_HOST = '127.0.0.1';
 delete process.env.SIGNAL_NEST_API_BASE;
 delete process.env.NEST_API_BASE;
+delete process.env.SIGNAL_PROXY_URL;
+delete process.env.SIGNAL_NO_PROXY;
+// Set BEFORE startServer() — boot payload is cached on first getBootPayload().
+// HTTPS_PROXY must not leak into /api/boot (and is otherwise unconsumed).
+process.env.HTTPS_PROXY = 'http://user:s3cret@h:3128';
+process.env.https_proxy = 'http://user:s3cret@h:3128';
 
 // Dynamically import server after setting env
 import type { Server as HttpServer } from 'node:http';
@@ -38,9 +45,11 @@ import { rendererConfigSchema } from '../../vendor/ts/types/RendererConfig.std.t
 import type { RequestFrame, ResponseFrame, ReleaseFrame, WireHandle } from '../bridge/protocol.std.ts';
 import { isWireHandle } from '../bridge/protocol.std.ts';
 import { closeSQL } from './sql.node.ts';
+import { invokeNative } from './native.node.ts';
 import { isAllowedProxyUrl, isAllowedProxyHost } from './proxy.node.ts';
 import { resolveNestUpstreamUrl, nestApiBaseFromEnv } from './nest-proxy.node.ts';
-import { isFsInside, getDataDir } from './paths.node.ts';
+import { isFsInside, getDataDir, getProxyConfig, redactProxyText, redactProxyUrl } from './paths.node.ts';
+import { signalFetch } from './signalFetch.node.ts';
 
 let serverInstance: HttpServer | null = null;
 let serverPort = 0;
@@ -328,8 +337,12 @@ async function runSmoke(): Promise<void> {
   await test('GET /api/health returns ok', async () => {
     const res = await httpGet(`${base}/api/health`);
     assert(res.status === 200, `Expected 200, got ${res.status}`);
-    const body = JSON.parse(res.body.toString('utf-8')) as { ok: boolean };
+    const body = JSON.parse(res.body.toString('utf-8')) as {
+      ok: boolean;
+      proxy?: { enabled: boolean };
+    };
     assert(body.ok === true, 'health.ok should be true');
+    assert(body.proxy?.enabled === false, 'health.proxy.enabled should be false without SIGNAL_PROXY_URL');
   });
 
   await test('proxy allowlist: apex captcha host allowed, others rejected', async () => {
@@ -385,6 +398,281 @@ async function runSmoke(): Promise<void> {
     ws.close();
     assert(isFsInside('/tmp/ui/bundles-evil/x', '/tmp/ui/bundles') === false, 'prefix bypass');
     assert(isFsInside('/tmp/ui/bundles/x', '/tmp/ui/bundles') === true, 'descendant allowed');
+  });
+
+  const connectTargets: Array<string> = [];
+  const proxyServer = http.createServer();
+  proxyServer.on('connect', (req, clientSocket, head) => {
+    const target = req.url ?? '';
+    connectTargets.push(target);
+    const sep = target.lastIndexOf(':');
+    const host = target.slice(0, sep);
+    const port = Number(target.slice(sep + 1));
+    const dest = net.connect(port, host, () => {
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      if (head.length) dest.write(head);
+      dest.pipe(clientSocket);
+      clientSocket.pipe(dest);
+    });
+    dest.on('error', () => {
+      try {
+        clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+      } catch {
+        /* ok */
+      }
+      clientSocket.destroy();
+    });
+    clientSocket.on('error', () => dest.destroy());
+  });
+  const proxyPort = await new Promise<number>((resolve, reject) => {
+    proxyServer.once('error', reject);
+    proxyServer.listen(0, '127.0.0.1', () => {
+      const addr = proxyServer.address();
+      resolve(typeof addr === 'object' && addr ? addr.port : 0);
+    });
+  });
+  const prevProxyUrl = process.env.SIGNAL_PROXY_URL;
+  process.env.SIGNAL_PROXY_URL = `http://127.0.0.1:${proxyPort}`;
+
+  await test('signalFetch tunnels HTTPS via a fake CONNECT proxy (Signal CA survives)', async () => {
+    connectTargets.length = 0;
+    let fetchResult: { status: number } | undefined;
+    let fetchError: Error | undefined;
+    try {
+      fetchResult = await signalFetch(new URL('https://cdn.signal.org/'), {
+        timeoutMs: 20_000,
+      });
+    } catch (error) {
+      fetchError = error instanceof Error ? error : new Error(String(error));
+    }
+    assert(
+      connectTargets.some(t => t === 'cdn.signal.org:443' || t === 'cdn.signal.org:443.'),
+      `proxy did not observe CONNECT cdn.signal.org:443; saw ${JSON.stringify(connectTargets)}`
+    );
+    if (fetchResult) {
+      assert(
+        typeof fetchResult.status === 'number' && fetchResult.status > 0,
+        `expected HTTP status through tunnel, got ${fetchResult.status}`
+      );
+    } else {
+      console.log(
+        '       (cdn.signal.org egress failed after CONNECT; TLS status not asserted:',
+        fetchError?.message,
+        ')'
+      );
+    }
+  });
+
+  await test('signalFetch bypasses the proxy for loopback targets', async () => {
+    connectTargets.length = 0;
+    try {
+      await signalFetch(new URL('https://127.0.0.1/'), { timeoutMs: 2_000 });
+    } catch {
+      // Direct loopback TLS is expected to fail; the proxy must see nothing.
+    }
+    assert(
+      connectTargets.length === 0,
+      `loopback must bypass proxy; CONNECTs: ${JSON.stringify(connectTargets)}`
+    );
+  });
+
+  if (prevProxyUrl === undefined) {
+    delete process.env.SIGNAL_PROXY_URL;
+  } else {
+    process.env.SIGNAL_PROXY_URL = prevProxyUrl;
+  }
+  await new Promise<void>(resolve => proxyServer.close(() => resolve()));
+
+  await test('getProxyConfig accepts socks5', async () => {
+    const prev = process.env.SIGNAL_PROXY_URL;
+    try {
+      process.env.SIGNAL_PROXY_URL = 'socks5://p:1080';
+      const socks = getProxyConfig();
+      assert(socks.mode === 'on', `socks5://p:1080 should be on, got ${JSON.stringify(socks)}`);
+      assert(socks.mode === 'on' && socks.spec.port === 1080, 'socks5 default port');
+    } finally {
+      if (prev === undefined) {
+        delete process.env.SIGNAL_PROXY_URL;
+      } else {
+        process.env.SIGNAL_PROXY_URL = prev;
+      }
+    }
+  });
+
+  await test('getProxyConfig is invalid for socks6, port 0, path, hash, org.signal.tls, garbage', async () => {
+    const prev = process.env.SIGNAL_PROXY_URL;
+    const cases = [
+      'socks6://p:1080',
+      'http://p:0',
+      'http://p/path',
+      'socks5://p:1080#comment',
+      'org.signal.tls://u:p@h:443',
+      'not a url !!',
+    ];
+    try {
+      for (const raw of cases) {
+        process.env.SIGNAL_PROXY_URL = raw;
+        const cfg = getProxyConfig();
+        assert(cfg.mode === 'invalid', `${raw} should be invalid, got ${JSON.stringify(cfg)}`);
+      }
+    } finally {
+      if (prev === undefined) {
+        delete process.env.SIGNAL_PROXY_URL;
+      } else {
+        process.env.SIGNAL_PROXY_URL = prev;
+      }
+    }
+  });
+
+  await test('/api/boot omits proxyUrl and does not leak HTTPS_PROXY credentials', async () => {
+    const res = await httpGet(`${base}/api/boot`);
+    assert(res.status === 200, `Expected 200, got ${res.status}`);
+    const payload = JSON.parse(res.body.toString('utf-8')) as {
+      sync: { 'get-config': Record<string, unknown> };
+    };
+    const config = payload.sync['get-config'];
+    assert(!('proxyUrl' in config), 'get-config must not contain proxyUrl');
+    const serialized = res.body.toString('utf-8');
+    // `user` alone appears in unrelated keys (userDataPath); check the credential pair.
+    assert(!serialized.includes('user:s3cret'), 'boot payload must not contain HTTPS_PROXY userinfo');
+    assert(!serialized.includes('s3cret'), 'boot payload must not contain HTTPS_PROXY password');
+  });
+
+  await test('redactProxyUrl strips userinfo', async () => {
+    const redacted = redactProxyUrl('http://user:s3cret@h:3128');
+    assert(!redacted.includes('user'), `redacted still contains user: ${redacted}`);
+    assert(!redacted.includes('s3cret'), `redacted still contains password: ${redacted}`);
+  });
+
+  await test('signalFetch errors redact password from message and cause', async () => {
+    const closing = http.createServer();
+    closing.on('connect', (_req, clientSocket) => {
+      clientSocket.destroy();
+    });
+    const closingPort = await new Promise<number>((resolve, reject) => {
+      closing.once('error', reject);
+      closing.listen(0, '127.0.0.1', () => {
+        const addr = closing.address();
+        resolve(typeof addr === 'object' && addr ? addr.port : 0);
+      });
+    });
+    const prev = process.env.SIGNAL_PROXY_URL;
+    process.env.SIGNAL_PROXY_URL = `http://myuser:sup3rs3cret@127.0.0.1:${closingPort}`;
+    try {
+      let err: Error | undefined;
+      try {
+        await signalFetch(new URL('https://cdn.signal.org/'), { timeoutMs: 5_000 });
+      } catch (error) {
+        err = error instanceof Error ? error : new Error(String(error));
+      }
+      assert(err != null, 'expected proxied signalFetch to fail when CONNECT closes');
+      assert(
+        !err.message.includes('sup3rs3cret'),
+        `err.message leaked password: ${err.message}`
+      );
+      const causeMessage = (err.cause as Error | undefined)?.message;
+      assert(
+        causeMessage == null || !causeMessage.includes('sup3rs3cret'),
+        `err.cause.message leaked password: ${causeMessage}`
+      );
+    } finally {
+      if (prev === undefined) {
+        delete process.env.SIGNAL_PROXY_URL;
+      } else {
+        process.env.SIGNAL_PROXY_URL = prev;
+      }
+      await new Promise<void>(resolve => closing.close(() => resolve()));
+    }
+  });
+
+  await test('redactProxyText does not over-replace a one-character username', async () => {
+    const prev = process.env.SIGNAL_PROXY_URL;
+    process.env.SIGNAL_PROXY_URL = 'http://s:sup3rs3cret@h:3128';
+    try {
+      const unrelated = 'socket hang up connecting to host';
+      const redacted = redactProxyText(unrelated);
+      assert(
+        redacted === unrelated,
+        `one-char username mangled unrelated text: ${redacted}`
+      );
+      const withSecret = redactProxyText('socket failed: sup3rs3cret');
+      assert(!withSecret.includes('sup3rs3cret'), `password survived: ${withSecret}`);
+      assert(withSecret.includes('socket'), `unrelated word dropped: ${withSecret}`);
+    } finally {
+      if (prev === undefined) {
+        delete process.env.SIGNAL_PROXY_URL;
+      } else {
+        process.env.SIGNAL_PROXY_URL = prev;
+      }
+    }
+  });
+
+  // TESTING_ConnectionManager_isUsingProxy returns a number. Observed
+  // empirically against libsignal 0.94.1 (do not invert these):
+  //   0  = no proxy / after clear_proxy
+  //   1  = proxy applied (ConnectionManager_set_proxy)
+  //  -1  = invalid proxy (ConnectionManager_set_invalid_proxy)
+  await test('libsignal ConnectionManager_new applies SIGNAL_PROXY_URL server-side', async () => {
+    const prev = process.env.SIGNAL_PROXY_URL;
+    const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+    const call = (method: string, args: unknown[]): Promise<unknown> =>
+      invokeNative(method, args, null, pending, null);
+    try {
+      delete process.env.SIGNAL_PROXY_URL;
+      const mapOff = await call('BridgedStringMap_new', [0]);
+      const cmOff = await call('ConnectionManager_new', [1, 'signal-web-smoke', mapOff, 0]);
+      const off = await call('TESTING_ConnectionManager_isUsingProxy', [cmOff]);
+      assert(off === 0, `no-proxy isUsingProxy should be 0, got ${String(off)}`);
+
+      process.env.SIGNAL_PROXY_URL = 'http://127.0.0.1:3128';
+      const mapOn = await call('BridgedStringMap_new', [0]);
+      const cmOn = await call('ConnectionManager_new', [1, 'signal-web-smoke', mapOn, 0]);
+      const on = await call('TESTING_ConnectionManager_isUsingProxy', [cmOn]);
+      assert(on === 1, `proxy-applied isUsingProxy should be 1, got ${String(on)}`);
+
+      await call('ConnectionManager_set_invalid_proxy', [cmOn]);
+      const invalid = await call('TESTING_ConnectionManager_isUsingProxy', [cmOn]);
+      assert(invalid === -1, `invalid-proxy isUsingProxy should be -1, got ${String(invalid)}`);
+    } finally {
+      if (prev === undefined) {
+        delete process.env.SIGNAL_PROXY_URL;
+      } else {
+        process.env.SIGNAL_PROXY_URL = prev;
+      }
+    }
+  });
+
+  await test('bridge-issued ConnectionManager_clear_proxy is refused while enforced', async () => {
+    const prev = process.env.SIGNAL_PROXY_URL;
+    process.env.SIGNAL_PROXY_URL = 'http://127.0.0.1:3128';
+    const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+    try {
+      const map = await invokeNative('BridgedStringMap_new', [0], null, pending, null);
+      const cm = await invokeNative(
+        'ConnectionManager_new',
+        [1, 'signal-web-smoke', map, 0],
+        null,
+        pending,
+        null
+      );
+      let threw = false;
+      try {
+        await invokeNative('ConnectionManager_clear_proxy', [cm], null, pending, null);
+      } catch (error) {
+        threw = true;
+        assert(
+          (error as Error).name === 'SignalWebProxyEnforced',
+          `expected SignalWebProxyEnforced, got ${(error as Error).name}: ${(error as Error).message}`
+        );
+      }
+      assert(threw, 'expected ConnectionManager_clear_proxy to be refused');
+    } finally {
+      if (prev === undefined) {
+        delete process.env.SIGNAL_PROXY_URL;
+      } else {
+        process.env.SIGNAL_PROXY_URL = prev;
+      }
+    }
   });
 
   // ---- Summary ---------------------------------------------------------------

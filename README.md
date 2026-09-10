@@ -51,7 +51,11 @@ The process binds **127.0.0.1** by default. Set `SIGNAL_LISTEN_HOST=0.0.0.0` onl
 | `SIGNAL_WEB_LOCALE` | `en` | Locale hint for `/api/boot` |
 | `SIGNAL_CORS_ORIGIN` | `*` | CORS `Access-Control-Allow-Origin` (pairing / cross-origin UI) |
 | `SIGNAL_NEST_API_BASE` | *(unset)* | Optional LeanScrm Nest reverse proxy; disabled when unset |
+| `SIGNAL_PROXY_URL` | *(unset)* | Outbound proxy for server-side Signal egress (`http`/`https`/`socks`/`socks4`/`socks4a`/`socks5`/`socks5h`). No path/query/hash. Other schemes fail startup. |
+| `SIGNAL_NO_PROXY` | `127.0.0.1,localhost,::1` (+ Nest hostname) | Comma-separated hosts that bypass the proxy (exact match or `.suffix`) |
 | `SIGNAL_WEB_TRACE` | *(unset)* | Verbose native / attachment logging |
+
+`HTTPS_PROXY` / `https_proxy` are not consumed anywhere (including `/api/boot`). Use `SIGNAL_PROXY_URL`.
 
 ## Layout
 
@@ -63,7 +67,7 @@ The process binds **127.0.0.1** by default. Set `SIGNAL_LISTEN_HOST=0.0.0.0` onl
 
 ## API surface
 
-- `GET /api/health` - liveness (`{ ok, version, serverSessionId }`)
+- `GET /api/health` - liveness (`{ ok, version, serverSessionId, proxy: { enabled } }`)
 - `GET /api/boot` - renderer config + locale + native manifest
 - `WS /api/bridge` - sql / ipc / native / fs (msgpack)
 - `POST /api/bridge/sync` - sync native calls

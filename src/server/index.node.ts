@@ -56,6 +56,8 @@ import {
   getSignalEnv,
   getLocaleHint,
   getCorsOrigin,
+  getProxyConfig,
+  redactProxyUrl,
   nativeManifestPath,
   nativeManifestFallbackPath,
   isFsInside,
@@ -315,6 +317,7 @@ async function handleHttpRequest(
         version: getPkgVersion(),
         serverSessionId: SERVER_SESSION_ID,
         cors: getCorsOrigin(),
+        proxy: { enabled: getProxyConfig().mode === 'on' },
       })
     );
     return;
@@ -438,6 +441,13 @@ export async function startServer(): Promise<http.Server> {
   const dataDir = getDataDir();
   mkdirSync(dataDir, { recursive: true });
 
+  const proxyConfig = getProxyConfig();
+  if (proxyConfig.mode === 'invalid') {
+    throw new Error(
+      `Invalid SIGNAL_PROXY_URL (${redactProxyUrl(proxyConfig.raw)}): ${proxyConfig.reason}`
+    );
+  }
+
   // Init subsystems
   initIpc(dataDir);
   initFs(dataDir);
@@ -531,6 +541,12 @@ export async function startServer(): Promise<http.Server> {
       console.log(`  Static UI: ${getStaticRoot() ?? '(disabled — set STATIC_ROOT to enable)'}`);
       console.log(`  Env: ${getSignalEnv()}`);
       console.log(`  CORS origin: ${getCorsOrigin()}`);
+      if (proxyConfig.mode === 'on') {
+        const { scheme, host, port } = proxyConfig.spec;
+        console.log(`  Proxy: ${scheme}://${host}:${port}`);
+      } else {
+        console.log('  Proxy: disabled (set SIGNAL_PROXY_URL)');
+      }
       const nestBase = nestApiBaseFromEnv();
       if (nestBase) {
         console.log(`  Nest proxy: /api/nest → ${nestBase}`);
