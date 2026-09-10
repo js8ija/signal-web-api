@@ -205,6 +205,33 @@ in the host app, not this repo.
 
 ---
 
+### 11. Hosted web page + local API via `?apiOrigin=`
+
+**Problem**: The product UI will be deployed on a public origin. The bridge
+must stay on the user's machine. Each visit passes the loopback address in
+the URL; the page must not assume same-origin `window.location.host`.
+
+**Workaround**:
+- `src/bridge/origin.web.ts` reads `apiOrigin` / `api` / `token` from query
+  or hash, rejects non-loopback targets, and strips the token from the
+  address bar.
+- `BridgeClient` opens WS / sync XHR against that origin and sends the
+  bearer token.
+- `SIGNAL_WEB_UI_URL` allowlists the hosted Origin. `/open` 302s to
+  `{ui}?apiOrigin=http://127.0.0.1:<port>#token=…`. `/api/connect` hands
+  the file token to an already-allowlisted Origin (no query-string leak
+  to the UI host).
+- Chrome Private Network Access: OPTIONS answers
+  `Access-Control-Allow-Private-Network: true`.
+- `web/` is a deployable console (also served at `/` when `STATIC_ROOT`
+  is unset, and at `/console`).
+
+**Files affected**: `src/bridge/origin.web.ts`, `client.web.ts`,
+`src/server/pair.node.ts`, `auth.node.ts`, `http-util.node.ts`,
+`index.node.ts`, `web/`.
+
+---
+
 ## IPC Channel Behavior
 
 ### Settings Channels

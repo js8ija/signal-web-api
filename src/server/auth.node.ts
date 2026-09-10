@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { getCorsOrigin, getListenHost } from './paths.node.ts';
+import { webUiOriginFromEnv } from './pair.node.ts';
 
 export const API_TOKEN_NAME = 'api-token';
 
@@ -152,6 +153,10 @@ export function allowedOrigins(boundPort: number): Set<string> {
   const cors = getCorsOrigin();
   if (cors && cors !== '*') {
     out.add(cors.replace(/\/$/, ''));
+  }
+  const ui = webUiOriginFromEnv();
+  if (ui) {
+    out.add(ui);
   }
   for (const part of (process.env.SIGNAL_ALLOWED_ORIGINS ?? '').split(',')) {
     const o = part.trim().replace(/\/$/, '');

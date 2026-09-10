@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Signal Web · 本地桥接</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <p class="kicker">线上页面 · 本地 API</p>
+        <h1>Signal Web 桥接</h1>
+        <p class="lede">
+          页面可以部署到任意 HTTPS 域名。每次打开用
+          <code>?apiOrigin=http://127.0.0.1:端口</code>
+          指向本机已启动的桥接进程。
+        </p>
+      </header>
+
+      <section class="card" id="status-card">
+        <div class="row">
+          <span class="dot" id="dot" data-state="idle"></span>
+          <div>
+            <h2 id="status-title">等待本地地址</h2>
+            <p class="muted" id="status-detail">URL 里还没有合法的 loopback apiOrigin。</p>
+          </div>
+        </div>
+        <dl class="meta">
+          <div>
+            <dt>apiOrigin</dt>
+            <dd id="api-origin">—</dd>
+          </div>
+          <div>
+            <dt>鉴权</dt>
+            <dd id="api-auth">—</dd>
+          </div>
+          <div>
+            <dt>会话</dt>
+            <dd id="api-session">—</dd>
+          </div>
+        </dl>
+        <label class="field">
+          <span>手动填写本地 API</span>
+          <input
+            id="api-input"
+            type="url"
+            spellcheck="false"
+            placeholder="http://127.0.0.1:8915"
+          />
+        </label>
+        <div class="actions">
+          <button type="button" id="connect-btn">连接</button>
+          <button type="button" class="ghost" id="copy-btn">复制启动链接</button>
+        </div>
+      </section>
+
+      <section class="card log-card">
+        <h2>通信日志</h2>
+        <ol id="log" class="log"></ol>
+      </section>
+    </main>
+    <script src="./app.js"></script>
+  </body>
+</html>

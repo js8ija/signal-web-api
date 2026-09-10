@@ -63,6 +63,8 @@ import { signalFetch } from './signalFetch.node.ts';
 import { mintApiToken, isAllowedHostHeader, isAllowedOrigin } from './auth.node.ts';
 import { acquireInstanceLock } from './lock.node.ts';
 import { loadOrCreateSqlKey } from './sql.node.ts';
+import { canonicalizeLoopbackApiOrigin, parseLaunchParams } from '../bridge/origin.web.ts';
+import { buildUiLaunchUrl, publicApiOrigin } from './pair.node.ts';
 
 let serverInstance: HttpServer | null = null;
 let serverPort = 0;
@@ -887,6 +889,94 @@ async function runSmoke(): Promise<void> {
     assert(del.status === 200, `admin DELETE should be 200, got ${del.status}`);
     const afterDel = await call('TESTING_ConnectionManager_isUsingProxy', [existing]);
     assert(afterDel === 0, `existing CM should clear proxy after DELETE, got ${String(afterDel)}`);
+  });
+
+  await test('apiOrigin parser accepts loopback and rejects remote hosts', async () => {
+    assert(
+      canonicalizeLoopbackApiOrigin('http://127.0.0.1:8915') === 'http://127.0.0.1:8915',
+      '127.0.0.1 must canonicalize'
+    );
+    assert(canonicalizeLoopbackApiOrigin('https://evil.example') === undefined, 'remote host rejected');
+    assert(
+      canonicalizeLoopbackApiOrigin('http://user:pass@127.0.0.1:8915') === undefined,
+      'userinfo rejected'
+    );
+    const parsed = parseLaunchParams(
+      '?api=http://127.0.0.1:8915',
+      '#token=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    );
+    assert(parsed.apiOrigin === 'http://127.0.0.1:8915', `api alias: ${String(parsed.apiOrigin)}`);
+    assert(parsed.token?.length === 64, 'hash token parsed');
+  });
+
+  await test('console page and /api/connect pair a hosted UI to loopback', async () => {
+    const page = await httpGet(`${base}/`);
+    assert(page.status === 200, `GET / should be 200, got ${page.status}`);
+    assert(
+      page.body.toString('utf-8').includes('apiOrigin'),
+      'console HTML must mention apiOrigin'
+    );
+
+    const connect = await httpGet(`${base}/api/connect`);
+    assert(connect.status === 200, `GET /api/connect should be 200, got ${connect.status}`);
+    const pair = JSON.parse(connect.body.toString('utf-8')) as {
+      ok: boolean;
+      apiOrigin: string;
+      token: string;
+      uiUrl: string;
+    };
+    assert(pair.ok === true, 'connect.ok');
+    assert(pair.apiOrigin === publicApiOrigin(serverPort), `apiOrigin ${pair.apiOrigin}`);
+    assert(/^[0-9a-f]{64}$/i.test(pair.token), 'connect must return the file token');
+
+    const prevUi = process.env.SIGNAL_WEB_UI_URL;
+    process.env.SIGNAL_WEB_UI_URL = 'https://ui.example.test/app';
+    try {
+      assert(
+        isAllowedOrigin('https://ui.example.test', serverPort),
+        'SIGNAL_WEB_UI_URL origin must be allowlisted'
+      );
+      const preflight = await httpRequest(`${base}/api/health`, {
+        method: 'OPTIONS',
+        headers: {
+          Origin: 'https://ui.example.test',
+          'Access-Control-Request-Method': 'GET',
+          'Access-Control-Request-Private-Network': 'true',
+        },
+      });
+      assert(preflight.status === 204, `PNA preflight should be 204, got ${preflight.status}`);
+      assert(
+        preflight.headers['access-control-allow-origin'] === 'https://ui.example.test',
+        `ACAO ${String(preflight.headers['access-control-allow-origin'])}`
+      );
+      assert(
+        preflight.headers['access-control-allow-private-network'] === 'true',
+        'PNA header missing'
+      );
+
+      const hostedConnect = await httpRequest(`${base}/api/connect`, {
+        headers: { Origin: 'https://ui.example.test' },
+      });
+      assert(hostedConnect.status === 200, `hosted /api/connect ${hostedConnect.status}`);
+      assert(
+        hostedConnect.headers['access-control-allow-origin'] === 'https://ui.example.test',
+        'hosted connect must echo Origin'
+      );
+
+      const open = await httpRequest(`${base}/open?redirect=1`);
+      assert(open.status === 302, `GET /open?redirect=1 should 302, got ${open.status}`);
+      const location = String(open.headers.location ?? '');
+      const expected = buildUiLaunchUrl(serverPort, pair.token);
+      assert(location === expected, `Location ${location} !== ${expected}`);
+      assert(location.includes('apiOrigin='), 'redirect must carry apiOrigin');
+      assert(location.includes('#token='), 'redirect must put token in the hash');
+    } finally {
+      if (prevUi === undefined) {
+        delete process.env.SIGNAL_WEB_UI_URL;
+      } else {
+        process.env.SIGNAL_WEB_UI_URL = prevUi;
+      }
+    }
   });
 
   // ---- Summary ---------------------------------------------------------------

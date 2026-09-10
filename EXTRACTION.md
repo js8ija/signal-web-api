@@ -116,3 +116,4 @@ AGPL-3.0-only; see LICENSE.
 ## Runtime notes (2026-09-10)
 - Outbound proxy is `SIGNAL_PROXY_URL` (not `HTTPS_PROXY`); http/https/socks* applied to both Node HTTPS and libsignal ConnectionManagers
 - Local supervisor hooks: default API auth + `instance.lock` + `PUT /api/admin/proxy` hot-swap; this repo does not spawn processes
+- Hosted UI talks to the local process via `?apiOrigin=http://127.0.0.1:<port>` (`SIGNAL_WEB_UI_URL`, `/open`, `/api/connect`)

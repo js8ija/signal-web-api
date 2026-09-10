@@ -17,6 +17,7 @@
  *   SIGNAL_WEB_LOCALE     Default locale hint (default 'en')
  *   SIGNAL_CORS_ORIGIN    Concrete CORS origin (default: loopback, not *)
  *   SIGNAL_ALLOWED_ORIGINS Extra browser origins for the local host UI
+ *   SIGNAL_WEB_UI_URL     Hosted UI; /open redirects with ?apiOrigin=
  *   SIGNAL_API_AUTH       Default on; `off` skips bearer on non-admin routes
  *   SIGNAL_NEST_API_BASE  LeanScrm Nest base (e.g. http://127.0.0.1:3010);
  *                         enables /api/nest reverse proxy + /api/nest-config
@@ -64,6 +65,7 @@ import {
   getSignalEnv,
   getLocaleHint,
   getProxyConfig,
+  getWebUiUrl,
   setRuntimeProxyUrl,
   redactProxyUrl,
   nativeManifestPath,
@@ -89,6 +91,7 @@ import {
   tokensMatch,
 } from './auth.node.ts';
 import { acquireInstanceLock, type InstanceLock } from './lock.node.ts';
+import { buildUiLaunchUrl, connectPayload, publicApiOrigin } from './pair.node.ts';
 
 // ---- configuration -----------------------------------------------------------
 
@@ -146,10 +149,18 @@ function getMime(filepath: string): string {
 
 // Map of URL prefix → filesystem root.
 // Desktop UI static mounts are only enabled when STATIC_ROOT is set.
+function getConsoleRoot(): string {
+  return join(getAssetsRoot(), 'web');
+}
+
 function getStaticMounts(): Array<{ prefix: string; root: string }> {
+  const consoleRoot = getConsoleRoot();
+  const consoleMounts: Array<{ prefix: string; root: string }> = [
+    { prefix: '/console', root: consoleRoot },
+  ];
   const staticRoot = getStaticRoot();
   if (!staticRoot) {
-    return [];
+    return [{ prefix: '/', root: consoleRoot }, ...consoleMounts];
   }
   return [
     { prefix: '/bundles-web', root: join(staticRoot, 'bundles-web') },
@@ -164,6 +175,7 @@ function getStaticMounts(): Array<{ prefix: string; root: string }> {
       root: join(staticRoot, 'node_modules', 'intl-tel-input', 'build', 'img'),
     },
     { prefix: '/', root: join(staticRoot, 'web', 'static') },
+    ...consoleMounts,
   ];
 }
 
@@ -175,11 +187,14 @@ function serveStaticFile(urlPath: string, res: http.ServerResponse): boolean {
       urlPath === mount.prefix ||
       urlPath.startsWith(mount.prefix + '/')
     ) {
-      const relPath = isRootMount
+      let relPath = isRootMount
         ? urlPath === '/'
           ? '/index.html'
           : urlPath
         : urlPath.slice(mount.prefix.length) || '/index.html';
+      if (relPath.endsWith('/')) {
+        relPath = `${relPath}index.html`;
+      }
       const candidate = resolve(mount.root, '.' + relPath);
       const mountRoot = resolve(mount.root);
       if (!isFsInside(candidate, mountRoot, true) && candidate !== mountRoot) {
@@ -199,6 +214,8 @@ function serveStaticFile(urlPath: string, res: http.ServerResponse): boolean {
           urlPath === '/' ||
           urlPath.endsWith('.html') ||
           urlPath === '/sw.js' ||
+          urlPath === '/app.js' ||
+          urlPath.endsWith('/app.js') ||
           extname(candidate).toLowerCase() === '.css';
         res.writeHead(200, {
           'Content-Type': contentType,
@@ -459,6 +476,7 @@ async function handleHttpRequest(
   }
 
   const isHealth = pathname === '/api/health' || pathname === '/healthz';
+  const isConnect = pathname === '/api/connect' || pathname === '/api/pair';
   const isAdmin = pathname === '/api/admin/proxy' || pathname.startsWith('/api/admin/');
   if (isAdmin && !hasValidToken(req, url)) {
     res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -467,6 +485,7 @@ async function handleHttpRequest(
   }
   if (
     !isHealth &&
+    !isConnect &&
     !isAdmin &&
     pathname.startsWith('/api/') &&
     isApiAuthEnabled() &&
@@ -488,6 +507,42 @@ async function handleHttpRequest(
         proxy: { enabled: getProxyConfig().mode === 'on' },
       })
     );
+    return;
+  }
+
+  if (req.method === 'GET' && isConnect) {
+    if (!apiToken) {
+      res.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Token not ready');
+      return;
+    }
+    sendJson(
+      res,
+      200,
+      connectPayload(boundPort || getPort(), apiToken, isApiAuthEnabled())
+    );
+    return;
+  }
+
+  if ((req.method === 'GET' || req.method === 'HEAD') && pathname === '/open') {
+    if (!apiToken) {
+      res.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Token not ready');
+      return;
+    }
+    const port = boundPort || getPort();
+    const accept = String(req.headers.accept ?? '');
+    const wantsRedirect =
+      url.searchParams.get('redirect') === '1' || accept.includes('text/html');
+    if (wantsRedirect) {
+      res.writeHead(302, {
+        Location: buildUiLaunchUrl(port, apiToken),
+        'Cache-Control': 'no-store',
+      });
+      res.end();
+      return;
+    }
+    sendJson(res, 200, connectPayload(port, apiToken, isApiAuthEnabled()));
     return;
   }
 
@@ -742,8 +797,16 @@ async function listenAfterLock(dataDir: string): Promise<http.Server> {
       console.log(`  Assets root: ${getAssetsRoot()}`);
       console.log(`  Static UI: ${getStaticRoot() ?? '(disabled — set STATIC_ROOT to enable)'}`);
       console.log(`  Env: ${getSignalEnv()}`);
-      console.log(`  CORS: loopback + SIGNAL_ALLOWED_ORIGINS / SIGNAL_CORS_ORIGIN`);
+      console.log(`  CORS: loopback + SIGNAL_WEB_UI_URL / SIGNAL_ALLOWED_ORIGINS / SIGNAL_CORS_ORIGIN`);
       console.log(`  Auth: ${isApiAuthEnabled() ? `on (token ${apiTokenPath(dataDir)})` : 'off (SIGNAL_API_AUTH=off)'}`);
+      const launch = apiToken ? buildUiLaunchUrl(actualPort, apiToken) : publicApiOrigin(actualPort);
+      if (getWebUiUrl()) {
+        console.log(`  Hosted UI: ${getWebUiUrl()}`);
+        console.log(`  Open: ${launch}`);
+      } else {
+        console.log(`  Console: ${publicApiOrigin(actualPort)}/  (set SIGNAL_WEB_UI_URL to bounce to a hosted page)`);
+        console.log(`  Launch URL: ${publicApiOrigin(actualPort)}/?apiOrigin=${publicApiOrigin(actualPort)}`);
+      }
       if (!isApiAuthEnabled() && !isLoopbackListenHost(host)) {
         console.warn(
           '  WARNING: SIGNAL_API_AUTH=off and SIGNAL_LISTEN_HOST is not loopback — the unauthenticated bridge is exposed'
