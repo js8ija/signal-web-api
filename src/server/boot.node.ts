@@ -256,9 +256,6 @@ export function buildBootPayload(opts: BootOptions): BootPayload {
     osVersion: os.version(),
     // Optional string fields: use undefined to omit (msgpack would encode undefined as null which fails schema)
     ...(process.env.NODE_APP_INSTANCE ? { appInstance: process.env.NODE_APP_INSTANCE } : {}),
-    ...((process.env.HTTPS_PROXY || process.env.https_proxy)
-      ? { proxyUrl: (process.env.HTTPS_PROXY || process.env.https_proxy) as string }
-      : {}),
     contentProxyUrl: getConfigValue<string>(cfg, 'contentProxyUrl') ?? 'http://contentproxy.signal.org:443',
     sfuUrl: getConfigValue<string>(cfg, 'sfuUrl') ?? 'https://sfu.voip.signal.org/',
     reducedMotionSetting: false,

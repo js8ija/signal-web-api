@@ -45,8 +45,10 @@ detected by `isRawExternal()` (null prototype, no enumerable keys).
 as `null`). `rendererConfigSchema` uses `configOptionalStringSchema` which accepts
 `string | undefined` but rejects `null`.
 
-**Workaround**: Optional config fields (`appInstance`, `proxyUrl`) are only included
-in the config object when they have a real value (via object spread). A
+**Workaround**: Optional config fields (`appInstance`) are only included
+in the config object when they have a real value (via object spread).
+`proxyUrl` remains an optional schema field but is never populated here —
+`HTTPS_PROXY` is not consumed and is not copied into `/api/boot`. A
 `stripUndefined()` pass is applied to the validated config before it enters the
 BootPayload.
 

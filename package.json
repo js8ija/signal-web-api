@@ -22,7 +22,8 @@
     "pino": "^9.6.0",
     "buffer": "^6.0.3",
     "@signalapp/sqlcipher": "3.3.5",
-    "@signalapp/ringrtc": "2.69.0"
+    "@signalapp/ringrtc": "2.69.0",
+    "https-proxy-agent": "7.0.6"
   },
   "devDependencies": {
     "@types/node": "24.12.0",

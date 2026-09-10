@@ -196,6 +196,7 @@ export async function handleNestProxy(
     headers['content-length'] = body.length;
   }
 
+  // Nest is a local upstream by design — always bypass SIGNAL_PROXY_URL.
   await new Promise<void>(resolve => {
     const upstream = lib.request(
       {
