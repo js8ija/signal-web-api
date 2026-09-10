@@ -45,6 +45,7 @@ import { rendererConfigSchema } from '../../vendor/ts/types/RendererConfig.std.t
 import type { RequestFrame, ResponseFrame, ReleaseFrame, WireHandle } from '../bridge/protocol.std.ts';
 import { isWireHandle } from '../bridge/protocol.std.ts';
 import { closeSQL } from './sql.node.ts';
+import { invokeNative } from './native.node.ts';
 import { isAllowedProxyUrl, isAllowedProxyHost } from './proxy.node.ts';
 import { resolveNestUpstreamUrl, nestApiBaseFromEnv } from './nest-proxy.node.ts';
 import { isFsInside, getDataDir, getProxyConfig, redactProxyUrl } from './paths.node.ts';
@@ -524,6 +525,74 @@ async function runSmoke(): Promise<void> {
     const redacted = redactProxyUrl('http://user:s3cret@h:3128');
     assert(!redacted.includes('user'), `redacted still contains user: ${redacted}`);
     assert(!redacted.includes('s3cret'), `redacted still contains password: ${redacted}`);
+  });
+
+  // TESTING_ConnectionManager_isUsingProxy returns a number. Observed
+  // empirically against libsignal 0.94.1 (do not invert these):
+  //   0  = no proxy / after clear_proxy
+  //   1  = proxy applied (ConnectionManager_set_proxy)
+  //  -1  = invalid proxy (ConnectionManager_set_invalid_proxy)
+  await test('libsignal ConnectionManager_new applies SIGNAL_PROXY_URL server-side', async () => {
+    const prev = process.env.SIGNAL_PROXY_URL;
+    const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+    const call = (method: string, args: unknown[]): Promise<unknown> =>
+      invokeNative(method, args, null, pending, null);
+    try {
+      delete process.env.SIGNAL_PROXY_URL;
+      const mapOff = await call('BridgedStringMap_new', [0]);
+      const cmOff = await call('ConnectionManager_new', [1, 'signal-web-smoke', mapOff, 0]);
+      const off = await call('TESTING_ConnectionManager_isUsingProxy', [cmOff]);
+      assert(off === 0, `no-proxy isUsingProxy should be 0, got ${String(off)}`);
+
+      process.env.SIGNAL_PROXY_URL = 'http://127.0.0.1:3128';
+      const mapOn = await call('BridgedStringMap_new', [0]);
+      const cmOn = await call('ConnectionManager_new', [1, 'signal-web-smoke', mapOn, 0]);
+      const on = await call('TESTING_ConnectionManager_isUsingProxy', [cmOn]);
+      assert(on === 1, `proxy-applied isUsingProxy should be 1, got ${String(on)}`);
+
+      await call('ConnectionManager_set_invalid_proxy', [cmOn]);
+      const invalid = await call('TESTING_ConnectionManager_isUsingProxy', [cmOn]);
+      assert(invalid === -1, `invalid-proxy isUsingProxy should be -1, got ${String(invalid)}`);
+    } finally {
+      if (prev === undefined) {
+        delete process.env.SIGNAL_PROXY_URL;
+      } else {
+        process.env.SIGNAL_PROXY_URL = prev;
+      }
+    }
+  });
+
+  await test('bridge-issued ConnectionManager_clear_proxy is refused while enforced', async () => {
+    const prev = process.env.SIGNAL_PROXY_URL;
+    process.env.SIGNAL_PROXY_URL = 'http://127.0.0.1:3128';
+    const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+    try {
+      const map = await invokeNative('BridgedStringMap_new', [0], null, pending, null);
+      const cm = await invokeNative(
+        'ConnectionManager_new',
+        [1, 'signal-web-smoke', map, 0],
+        null,
+        pending,
+        null
+      );
+      let threw = false;
+      try {
+        await invokeNative('ConnectionManager_clear_proxy', [cm], null, pending, null);
+      } catch (error) {
+        threw = true;
+        assert(
+          (error as Error).name === 'SignalWebProxyEnforced',
+          `expected SignalWebProxyEnforced, got ${(error as Error).name}: ${(error as Error).message}`
+        );
+      }
+      assert(threw, 'expected ConnectionManager_clear_proxy to be refused');
+    } finally {
+      if (prev === undefined) {
+        delete process.env.SIGNAL_PROXY_URL;
+      } else {
+        process.env.SIGNAL_PROXY_URL = prev;
+      }
+    }
   });
 
   // ---- Summary ---------------------------------------------------------------

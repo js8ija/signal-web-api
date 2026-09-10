@@ -151,6 +151,31 @@ touching `app/attachment_channel.main.ts`.
 
 ---
 
+### 9. Two-layer outbound proxy
+
+**Problem**: This process has two independent network stacks. Node's
+`http.Agent` / `https.request` cannot affect the Rust sockets opened by
+`@signalapp/libsignal-client`, and libsignal's `ConnectionManager_set_proxy`
+cannot affect `/api/proxy` or the optional-resources CDN fetch. A proxy
+applied at only one layer silently leaks the other.
+
+**Workaround**: `SIGNAL_PROXY_URL` is applied at both layers. The Node layer
+passes `https-proxy-agent` into `signalFetch` (`https.request`). The
+libsignal layer calls `ConnectionManager_set_proxy` immediately after
+`ConnectionManager_new`. v1 accepts only `http`/`https` — Node's agent
+cannot do SOCKS, so allowing `socks*` would mean "libsignal proxied, CDN
+direct". Startup fails closed on an invalid or unsupported URL. If applying
+the libsignal proxy throws, the manager is marked invalid
+(`ConnectionManager_set_invalid_proxy`) rather than leaking a direct
+connection. While enforcement is on, renderer-issued `set_proxy` /
+`clear_proxy` are refused (`ConnectionManager_set_invalid_proxy` can still
+tighten).
+
+**Files affected**: `src/server/paths.node.ts`, `signalFetch.node.ts`,
+`native.node.ts`, `index.node.ts`.
+
+---
+
 ## IPC Channel Behavior
 
 ### Settings Channels

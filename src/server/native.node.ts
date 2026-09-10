@@ -28,6 +28,7 @@ import {
   isWireCallback,
   toWireError,
 } from '../bridge/protocol.std.ts';
+import { getProxyConfig, redactProxyUrl } from './paths.node.ts';
 
 // ---- handle registry ----------------------------------------------------------
 
@@ -349,6 +350,18 @@ export async function invokeNative(
     return undefined;
   }
 
+  if (
+    (method === 'ConnectionManager_set_proxy' ||
+      method === 'ConnectionManager_clear_proxy') &&
+    getProxyConfig().mode === 'on'
+  ) {
+    const err = new Error(
+      'SIGNAL_PROXY_URL is enforced server-side; the renderer cannot set or clear the libsignal proxy. ConnectionManager_set_invalid_proxy remains available to tighten.'
+    );
+    err.name = 'SignalWebProxyEnforced';
+    throw err;
+  }
+
   const fn = Native[method];
   if (typeof fn !== 'function') {
     throw new Error(`Unknown native function: ${method}`);
@@ -381,5 +394,75 @@ export async function invokeNative(
     trace(`call ${method} → ok`);
   }
 
+  if (method === 'ConnectionManager_new' && getProxyConfig().mode === 'on') {
+    applyLibsignalProxy(resolved);
+  }
+
   return encodeResult(resolved);
+}
+
+let loggedLibsignalProxyApply = false;
+let loggedLibsignalProxyFail = false;
+
+function applyLibsignalProxy(resolved: unknown): void {
+  const cfg = getProxyConfig();
+  if (cfg.mode !== 'on') {
+    return;
+  }
+  const cmWrapper = { _nativeHandle: resolved };
+  const setInvalid = Native.ConnectionManager_set_invalid_proxy as
+    | ((cm: { _nativeHandle: unknown }) => void)
+    | undefined;
+  try {
+    const proxyCfg = (
+      Native.ConnectionProxyConfig_new as (
+        scheme: string,
+        host: string,
+        port: number,
+        username: string | null,
+        password: string | null
+      ) => unknown
+    )(
+      cfg.spec.scheme,
+      cfg.spec.host,
+      cfg.spec.port,
+      cfg.spec.username ?? null,
+      cfg.spec.password ?? null
+    );
+    (
+      Native.ConnectionManager_set_proxy as (
+        cm: { _nativeHandle: unknown },
+        proxy: { _nativeHandle: unknown }
+      ) => void
+    )(cmWrapper, { _nativeHandle: proxyCfg });
+    if (!loggedLibsignalProxyApply) {
+      loggedLibsignalProxyApply = true;
+      console.log(
+        `[native] libsignal proxy applied: ${cfg.spec.scheme}://${cfg.spec.host}:${cfg.spec.port}`
+      );
+    }
+    trace(
+      'ConnectionManager_new set_proxy',
+      `${cfg.spec.scheme}://${cfg.spec.host}:${cfg.spec.port}`
+    );
+  } catch (error) {
+    try {
+      setInvalid?.(cmWrapper);
+    } catch (invalidErr) {
+      console.error('[native] ConnectionManager_set_invalid_proxy failed:', invalidErr);
+    }
+    if (!loggedLibsignalProxyFail) {
+      loggedLibsignalProxyFail = true;
+      const detail = error instanceof Error ? error.message : String(error);
+      const redacted =
+        cfg.raw && detail.includes(cfg.raw)
+          ? detail.split(cfg.raw).join(redactProxyUrl(cfg.raw))
+          : detail;
+      console.error(
+        `[native] libsignal proxy apply failed; refusing connections (${redactProxyUrl(cfg.raw)}):`,
+        redacted
+      );
+    }
+    throw error;
+  }
 }
