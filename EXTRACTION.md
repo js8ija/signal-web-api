@@ -114,4 +114,4 @@ AGPL-3.0-only; see LICENSE.
 - Path/env helpers in `src/server/paths.node.ts` are lazy (safe to set env before `startServer()`)
 
 ## Runtime notes (2026-09-10)
-- Outbound proxy is `SIGNAL_PROXY_URL` (not `HTTPS_PROXY`); applied to both Node HTTPS and libsignal ConnectionManagers
+- Outbound proxy is `SIGNAL_PROXY_URL` (not `HTTPS_PROXY`); http/https/socks* applied to both Node HTTPS and libsignal ConnectionManagers

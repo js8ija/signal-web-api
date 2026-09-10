@@ -18,8 +18,9 @@
  *                        does not mount Desktop UI bundles (API-only mode).
  *   SIGNAL_CORS_ORIGIN   CORS Allow-Origin (default *). Set a concrete origin
  *                        to lock down cross-origin browser access.
- *   SIGNAL_PROXY_URL     Outbound HTTP(S) proxy for server-side Signal egress.
- *                        http/https only; unsupported schemes fail startup.
+ *   SIGNAL_PROXY_URL     Outbound proxy for server-side Signal egress.
+ *                        http/https and socks/socks4/socks4a/socks5/socks5h.
+ *                        Other schemes (incl. org.signal.tls) fail startup.
  *                        HTTPS_PROXY is not read and is not a fallback.
  *   SIGNAL_NO_PROXY      Comma-separated bypass hosts (exact or .suffix).
  *                        Defaults always include 127.0.0.1, localhost, ::1,
@@ -89,8 +90,24 @@ export type ProxyConfig =
   | { mode: 'on'; spec: ProxySpec; raw: string }
   | { mode: 'invalid'; raw: string; reason: string };
 
-const V1_PROXY_SCHEMES = new Set(['http', 'https']);
-const DEFAULT_PROXY_PORTS: Record<string, number> = { http: 80, https: 443 };
+const V1_PROXY_SCHEMES = new Set([
+  'http',
+  'https',
+  'socks',
+  'socks4',
+  'socks4a',
+  'socks5',
+  'socks5h',
+]);
+const DEFAULT_PROXY_PORTS: Record<string, number> = {
+  http: 80,
+  https: 443,
+  socks: 1080,
+  socks4: 1080,
+  socks4a: 1080,
+  socks5: 1080,
+  socks5h: 1080,
+};
 
 let cachedProxyEnv: string | undefined;
 let cachedProxyConfig: ProxyConfig | undefined;
@@ -118,8 +135,8 @@ function parseProxyUrl(raw: string): ProxyConfig {
       mode: 'invalid',
       raw,
       reason:
-        `v1 supports only http and https proxy schemes via SIGNAL_PROXY_URL ` +
-        `(not '${scheme}')`,
+        `unsupported SIGNAL_PROXY_URL scheme '${scheme}' ` +
+        `(http/https/socks/socks4/socks4a/socks5/socks5h only)`,
     };
   }
 

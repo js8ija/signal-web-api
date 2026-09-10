@@ -14,24 +14,25 @@
   "dependencies": {
     "@msgpack/msgpack": "^3.1.3",
     "@signalapp/libsignal-client": "0.94.1",
-    "ws": "^8.18.0",
-    "zod": "^3.24.0",
-    "lodash": "^4.17.21",
+    "@signalapp/ringrtc": "2.69.0",
+    "@signalapp/sqlcipher": "3.3.5",
+    "buffer": "^6.0.3",
     "fs-extra": "^11.2.0",
+    "https-proxy-agent": "7.0.6",
+    "lodash": "^4.17.21",
     "lru-cache": "^11.0.0",
     "pino": "^9.6.0",
-    "buffer": "^6.0.3",
-    "@signalapp/sqlcipher": "3.3.5",
-    "@signalapp/ringrtc": "2.69.0",
-    "https-proxy-agent": "7.0.6"
+    "socks-proxy-agent": "8.0.5",
+    "ws": "^8.18.0",
+    "zod": "^3.24.0"
   },
   "devDependencies": {
+    "@types/fs-extra": "^11.0.0",
+    "@types/lodash": "^4.17.0",
     "@types/node": "24.12.0",
     "@types/ws": "8.18.1",
     "tsx": "4.21.0",
-    "typescript": "6.0.3",
-    "@types/lodash": "^4.17.0",
-    "@types/fs-extra": "^11.0.0"
+    "typescript": "6.0.3"
   },
   "productName": "Signal Web API"
 }

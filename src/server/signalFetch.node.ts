@@ -13,7 +13,9 @@ import https from 'node:https';
 import tls from 'node:tls';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import type { Agent } from 'node:http';
 import { HttpsProxyAgent } from 'https-proxy-agent';
+import { SocksProxyAgent } from 'socks-proxy-agent';
 import {
   getAssetsRoot,
   getProxyConfig,
@@ -52,7 +54,11 @@ export type SignalFetchResult = {
 const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024;
 const PROXY_CONNECT_TIMEOUT_MS = 15_000;
 
-const proxyAgents = new Map<string, InstanceType<typeof HttpsProxyAgent>>();
+const proxyAgents = new Map<string, Agent>();
+
+function isSocksProxyScheme(scheme: string): boolean {
+  return scheme === 'socks' || scheme.startsWith('socks4') || scheme.startsWith('socks5');
+}
 
 function sanitizeProxyError(error: unknown): Error {
   const rawMessage = error instanceof Error ? error.message : String(error);
@@ -71,20 +77,24 @@ function sanitizeProxyError(error: unknown): Error {
   return err;
 }
 
-function getProxyAgent(proxyRaw: string): InstanceType<typeof HttpsProxyAgent> {
+function getProxyAgent(proxyRaw: string): Agent {
   const cached = proxyAgents.get(proxyRaw);
   if (cached) {
     return cached;
   }
+  const scheme = new URL(proxyRaw).protocol.slice(0, -1);
   const ca = getSignalCa();
-  // Through a CONNECT tunnel the TLS session is end-to-end with the target,
-  // so this CA list must still reach the handshake. Pass `ca` on both the
-  // request options and the agent so the agent's own tls.connect cannot drop
-  // it (otherwise Signal hosts fail with SELF_SIGNED_CERT_IN_CHAIN).
-  const agent = new HttpsProxyAgent(proxyRaw, {
-    ca,
-    timeout: PROXY_CONNECT_TIMEOUT_MS,
-  });
+  // HTTP(S) proxies: HttpsProxyAgent may tls.connect itself, so `ca` must be
+  // on the agent as well as the request. SOCKS agents return a raw TCP
+  // socket; Node's https.request then handshakes with requestOptions.ca.
+  // Either way the Signal private CA must reach the target handshake
+  // (otherwise Signal hosts fail with SELF_SIGNED_CERT_IN_CHAIN).
+  const agent = isSocksProxyScheme(scheme)
+    ? new SocksProxyAgent(proxyRaw, { timeout: PROXY_CONNECT_TIMEOUT_MS })
+    : new HttpsProxyAgent(proxyRaw, {
+        ca,
+        timeout: PROXY_CONNECT_TIMEOUT_MS,
+      });
   proxyAgents.set(proxyRaw, agent);
   return agent;
 }

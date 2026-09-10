@@ -483,12 +483,29 @@ async function runSmoke(): Promise<void> {
   }
   await new Promise<void>(resolve => proxyServer.close(() => resolve()));
 
-  await test('getProxyConfig is invalid for socks, port 0, path, org.signal.tls, garbage', async () => {
+  await test('getProxyConfig accepts socks5', async () => {
+    const prev = process.env.SIGNAL_PROXY_URL;
+    try {
+      process.env.SIGNAL_PROXY_URL = 'socks5://p:1080';
+      const socks = getProxyConfig();
+      assert(socks.mode === 'on', `socks5://p:1080 should be on, got ${JSON.stringify(socks)}`);
+      assert(socks.mode === 'on' && socks.spec.port === 1080, 'socks5 default port');
+    } finally {
+      if (prev === undefined) {
+        delete process.env.SIGNAL_PROXY_URL;
+      } else {
+        process.env.SIGNAL_PROXY_URL = prev;
+      }
+    }
+  });
+
+  await test('getProxyConfig is invalid for socks6, port 0, path, hash, org.signal.tls, garbage', async () => {
     const prev = process.env.SIGNAL_PROXY_URL;
     const cases = [
-      'socks5://p:1080',
+      'socks6://p:1080',
       'http://p:0',
       'http://p/path',
+      'socks5://p:1080#comment',
       'org.signal.tls://u:p@h:443',
       'not a url !!',
     ];
