@@ -14,6 +14,7 @@
 import { delimiter, join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { mkdirSync, existsSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
+import type { ObjectEncodingOptions } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { format } from 'node:util';
 import { getAssetsRoot, sqlWorkerPath } from './paths.node.ts';
@@ -170,7 +171,9 @@ async function terminateWorker(worker: Worker): Promise<void> {
   }
 }
 
-function loadOrCreateSqlKey(dataDir: string): string {
+const SQLCIPHER_KEY_HEX = /^[0-9a-f]{64}$/i;
+
+export function loadOrCreateSqlKey(dataDir: string): string {
   const configPath = join(dataDir, 'config.json');
   if (existsSync(configPath)) {
     let cfg: Record<string, unknown>;
@@ -184,24 +187,39 @@ function loadOrCreateSqlKey(dataDir: string): string {
       );
     }
     const key = cfg.key;
-    if (typeof key !== 'string' || key.length < 10) {
+    if (typeof key === 'string' && SQLCIPHER_KEY_HEX.test(key)) {
+      try {
+        chmodSync(configPath, 0o600);
+      } catch {
+        /* best-effort */
+      }
+      return key;
+    }
+    if (typeof cfg.encryptedKey === 'string' && cfg.encryptedKey.length > 0) {
       throw new Error(
-        `Invalid SQLCipher key in ${configPath}. Refusing to overwrite an existing config.`
+        `${configPath} has encryptedKey (Signal Desktop OS keyring) and no raw 64-hex key. ` +
+          `This bridge cannot unwrap it. Use a fresh SIGNAL_DATA_DIR or a config.json with "key".`
       );
     }
-    try {
-      chmodSync(configPath, 0o600);
-    } catch {
-      /* best-effort */
-    }
-    return key;
+    throw new Error(
+      `Invalid SQLCipher key in ${configPath} (expected 64 hex chars). ` +
+        `Refusing to overwrite an existing config.`
+    );
   }
 
   const key = randomBytes(32).toString('hex');
-  writeFileSync(configPath, JSON.stringify({ key }, null, 2), {
-    encoding: 'utf-8',
-    mode: 0o600,
-  });
+  try {
+    writeFileSync(configPath, JSON.stringify({ key }, null, 2), {
+      encoding: 'utf-8',
+      mode: 0o600,
+      flag: 'wx',
+    } as ObjectEncodingOptions);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      return loadOrCreateSqlKey(dataDir);
+    }
+    throw error;
+  }
   try {
     chmodSync(configPath, 0o600);
   } catch {

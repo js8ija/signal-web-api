@@ -176,6 +176,35 @@ renderer-issued `set_proxy` / `clear_proxy` are refused
 
 ---
 
+### 10. Local supervisor hooks (this process is not the supervisor)
+
+**Problem**: A commercial host app runs this API on the user's machine — one
+bridge process per Signal account — and talks to the browser itself. The
+bridge must refuse a second writer on the same data dir, stop serving `*`
+CORS / unauthenticated `/api/*` by default, and let the host hot-swap the
+outbound proxy without restarting.
+
+**Workaround**:
+- Exclusive `instance.lock` (`wx` + pid; reclaim dead pid; fail if live).
+- `config.json` create uses `wx`; existing keys must be 64 hex; Desktop
+  `encryptedKey` without a raw key is a distinct error.
+- Default API auth on. Token file `<dataDir>/api-token` (reused across
+  restarts). Host + Origin allowlists; WS `verifyClient`; CORS echoes an
+  allowed Origin only. `/api/health` is Host/Origin only. `/api/admin/*`
+  always requires the token, even when `SIGNAL_API_AUTH=off`.
+- `PUT`/`GET`/`DELETE /api/admin/proxy` updates a runtime override in
+  `getProxyConfig()` and reapplies it on every tracked
+  `ConnectionManager`. `SIGNAL_PROXY_URL` is the single-account env
+  fallback. `https://` still means TLS to the proxy.
+
+The supervisor (process table, browser reverse-proxy, per-account UI) lives
+in the host app, not this repo.
+
+**Files affected**: `src/server/auth.node.ts`, `lock.node.ts`, `sql.node.ts`,
+`paths.node.ts`, `native.node.ts`, `http-util.node.ts`, `index.node.ts`.
+
+---
+
 ## IPC Channel Behavior
 
 ### Settings Channels

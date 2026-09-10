@@ -15,7 +15,9 @@
  *                         bundles are not mounted (API-only).
  *   SIGNAL_ENV            production | staging | development (default production)
  *   SIGNAL_WEB_LOCALE     Default locale hint (default 'en')
- *   SIGNAL_CORS_ORIGIN    CORS Allow-Origin (default *)
+ *   SIGNAL_CORS_ORIGIN    Concrete CORS origin (default: loopback, not *)
+ *   SIGNAL_ALLOWED_ORIGINS Extra browser origins for the local host UI
+ *   SIGNAL_API_AUTH       Default on; `off` skips bearer on non-admin routes
  *   SIGNAL_NEST_API_BASE  LeanScrm Nest base (e.g. http://127.0.0.1:3010);
  *                         enables /api/nest reverse proxy + /api/nest-config
  */
@@ -38,7 +40,13 @@ import type {
 import { toWireError } from '../bridge/protocol.std.ts';
 import { buildBootPayload } from './boot.node.ts';
 import { initializeSQL, sqlCall, closeSQL } from './sql.node.ts';
-import { invokeNative, releaseHandles, handleCallbackResponse, initNative } from './native.node.ts';
+import {
+  invokeNative,
+  releaseHandles,
+  handleCallbackResponse,
+  initNative,
+  applyProxyToTrackedManagers,
+} from './native.node.ts';
 import { initIpc, handleIpcInvoke, warnSendOnce, setRemoveDbFn } from './ipc.node.ts';
 import { initFs, handleFsCall } from './fs.node.ts';
 import { initAttachments, handleAttachmentRequest } from './attachments.node.ts';
@@ -55,8 +63,8 @@ import {
   getStaticRoot,
   getSignalEnv,
   getLocaleHint,
-  getCorsOrigin,
   getProxyConfig,
+  setRuntimeProxyUrl,
   redactProxyUrl,
   nativeManifestPath,
   nativeManifestFallbackPath,
@@ -68,13 +76,34 @@ import {
   sendPayloadTooLarge,
   MAX_BODY_NATIVE_SYNC,
   MAX_BODY_PROXY,
+  MAX_BODY_ADMIN,
 } from './http-util.node.ts';
+import {
+  apiTokenPath,
+  extractProvidedToken,
+  isAllowedHostHeader,
+  isAllowedOrigin,
+  isApiAuthEnabled,
+  isLoopbackListenHost,
+  mintApiToken,
+  tokensMatch,
+} from './auth.node.ts';
+import { acquireInstanceLock, type InstanceLock } from './lock.node.ts';
 
 // ---- configuration -----------------------------------------------------------
 
 // Identifies this server process; the native handle registry is reset on
 // restart, so the browser reloads when it sees a new id (see protocol).
 const SERVER_SESSION_ID = randomUUID();
+let boundPort = getPort();
+let instanceLock: InstanceLock | undefined;
+let apiToken: string | undefined;
+
+function releaseInstanceLock(): void {
+  instanceLock?.release();
+  instanceLock = undefined;
+}
+
 function getPkgVersion(): string {
   try {
     return (JSON.parse(readFileSync(join(getAssetsRoot(), 'package.json'), 'utf-8')) as { version: string }).version;
@@ -297,29 +326,173 @@ function handleMessage(session: SessionState, data: Buffer | ArrayBuffer | Buffe
 
 // ---- HTTP handler -----------------------------------------------------------
 
+function sendJson(
+  res: http.ServerResponse,
+  status: number,
+  body: unknown
+): void {
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+  });
+  res.end(JSON.stringify(body));
+}
+
+function hasValidToken(req: http.IncomingMessage, url: URL): boolean {
+  return tokensMatch(extractProvidedToken(req, url), apiToken);
+}
+
+async function handleAdminProxy(
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+): Promise<void> {
+  const method = (req.method ?? 'GET').toUpperCase();
+  if (method === 'GET' || method === 'HEAD') {
+    const cfg = getProxyConfig();
+    const payload =
+      cfg.mode === 'on'
+        ? {
+            enabled: true,
+            scheme: cfg.spec.scheme,
+            host: cfg.spec.host,
+            port: cfg.spec.port,
+          }
+        : { enabled: false };
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+    });
+    if (method !== 'HEAD') {
+      res.end(JSON.stringify(payload));
+    } else {
+      res.end();
+    }
+    return;
+  }
+
+  if (method === 'DELETE') {
+    setRuntimeProxyUrl(null);
+    const applied = applyProxyToTrackedManagers();
+    sendJson(res, 200, { enabled: false, managers: applied });
+    return;
+  }
+
+  if (method !== 'PUT' && method !== 'POST') {
+    res.writeHead(405, { 'Content-Type': 'text/plain' });
+    res.end('Method Not Allowed');
+    return;
+  }
+
+  let body: Buffer;
+  try {
+    body = await readBody(req, MAX_BODY_ADMIN);
+  } catch (error) {
+    if ((error as { statusCode?: number }).statusCode === 413) {
+      sendPayloadTooLarge(res);
+      return;
+    }
+    throw error;
+  }
+
+  let urlRaw: string | null;
+  const text = body.toString('utf-8').trim();
+  if (text === '') {
+    urlRaw = null;
+  } else {
+    try {
+      const parsed = JSON.parse(text) as { url?: unknown };
+      if (parsed.url == null || parsed.url === '') {
+        urlRaw = null;
+      } else if (typeof parsed.url === 'string') {
+        urlRaw = parsed.url;
+      } else {
+        sendJson(res, 400, { error: 'url must be a string' });
+        return;
+      }
+    } catch {
+      urlRaw = text;
+    }
+  }
+
+  const next = setRuntimeProxyUrl(urlRaw);
+  if (next.mode === 'invalid') {
+    sendJson(res, 400, {
+      error: 'invalid proxy url',
+      reason: next.reason,
+      raw: redactProxyUrl(next.raw),
+    });
+    return;
+  }
+  const applied = applyProxyToTrackedManagers();
+  sendJson(res, 200, {
+    enabled: next.mode === 'on',
+    ...(next.mode === 'on'
+      ? { scheme: next.spec.scheme, host: next.spec.host, port: next.spec.port }
+      : {}),
+    managers: applied,
+  });
+}
+
 async function handleHttpRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse
 ): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://${getListenHost()}:${getPort()}`);
+  const url = new URL(req.url ?? '/', `http://${getListenHost()}:${boundPort || getPort()}`);
   const pathname = url.pathname;
 
-  applyCors(res);
+  if (!isAllowedHostHeader(req.headers.host, boundPort || getPort())) {
+    res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Forbidden host');
+    return;
+  }
+
+  const origin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
+  if (!isAllowedOrigin(origin, boundPort || getPort())) {
+    res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Forbidden origin');
+    return;
+  }
+
+  applyCors(req, res, boundPort || getPort());
   if (req.method === 'OPTIONS') {
     res.writeHead(204); res.end(); return;
   }
 
-  if (req.method === 'GET' && (pathname === '/api/health' || pathname === '/healthz')) {
+  const isHealth = pathname === '/api/health' || pathname === '/healthz';
+  const isAdmin = pathname === '/api/admin/proxy' || pathname.startsWith('/api/admin/');
+  if (isAdmin && !hasValidToken(req, url)) {
+    res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Unauthorized');
+    return;
+  }
+  if (
+    !isHealth &&
+    !isAdmin &&
+    pathname.startsWith('/api/') &&
+    isApiAuthEnabled() &&
+    !hasValidToken(req, url)
+  ) {
+    res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Unauthorized');
+    return;
+  }
+
+  if (req.method === 'GET' && isHealth) {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-cache' });
     res.end(
       JSON.stringify({
         ok: true,
         version: getPkgVersion(),
         serverSessionId: SERVER_SESSION_ID,
-        cors: getCorsOrigin(),
+        auth: isApiAuthEnabled(),
         proxy: { enabled: getProxyConfig().mode === 'on' },
       })
     );
+    return;
+  }
+
+  if (pathname === '/api/admin/proxy') {
+    await handleAdminProxy(req, res);
     return;
   }
 
@@ -440,6 +613,17 @@ async function handleHttpRequest(
 export async function startServer(): Promise<http.Server> {
   const dataDir = getDataDir();
   mkdirSync(dataDir, { recursive: true });
+  instanceLock = acquireInstanceLock(dataDir);
+  try {
+    return await listenAfterLock(dataDir);
+  } catch (error) {
+    releaseInstanceLock();
+    throw error;
+  }
+}
+
+async function listenAfterLock(dataDir: string): Promise<http.Server> {
+  apiToken = mintApiToken(dataDir);
 
   const proxyConfig = getProxyConfig();
   if (proxyConfig.mode === 'invalid') {
@@ -490,6 +674,23 @@ export async function startServer(): Promise<http.Server> {
     server,
     path: '/api/bridge',
     maxPayload: 16 * 1024 * 1024,
+    verifyClient: (info, done) => {
+      const port = boundPort || getPort();
+      const reqUrl = new URL(info.req.url ?? '/api/bridge', `http://${getListenHost()}:${port}`);
+      if (!isAllowedHostHeader(info.req.headers.host, port)) {
+        done(false, 403, 'Forbidden host');
+        return;
+      }
+      if (!isAllowedOrigin(info.origin, port)) {
+        done(false, 403, 'Forbidden origin');
+        return;
+      }
+      if (isApiAuthEnabled() && !tokensMatch(extractProvidedToken(info.req, reqUrl), apiToken)) {
+        done(false, 401, 'Unauthorized');
+        return;
+      }
+      done(true);
+    },
   });
   wss.on('connection', (ws: WebSocket) => {
     const session: SessionState = {
@@ -535,17 +736,24 @@ export async function startServer(): Promise<http.Server> {
       server.off('error', onError);
       const addr = server.address();
       const actualPort = typeof addr === 'object' && addr ? addr.port : port;
+      boundPort = actualPort;
       console.log(`Signal Web bridge listening on http://${host}:${actualPort}`);
       console.log(`  Data dir: ${dataDir}`);
       console.log(`  Assets root: ${getAssetsRoot()}`);
       console.log(`  Static UI: ${getStaticRoot() ?? '(disabled — set STATIC_ROOT to enable)'}`);
       console.log(`  Env: ${getSignalEnv()}`);
-      console.log(`  CORS origin: ${getCorsOrigin()}`);
+      console.log(`  CORS: loopback + SIGNAL_ALLOWED_ORIGINS / SIGNAL_CORS_ORIGIN`);
+      console.log(`  Auth: ${isApiAuthEnabled() ? `on (token ${apiTokenPath(dataDir)})` : 'off (SIGNAL_API_AUTH=off)'}`);
+      if (!isApiAuthEnabled() && !isLoopbackListenHost(host)) {
+        console.warn(
+          '  WARNING: SIGNAL_API_AUTH=off and SIGNAL_LISTEN_HOST is not loopback — the unauthenticated bridge is exposed'
+        );
+      }
       if (proxyConfig.mode === 'on') {
-        const { scheme, host, port } = proxyConfig.spec;
-        console.log(`  Proxy: ${scheme}://${host}:${port}`);
+        const { scheme, host: proxyHost, port: proxyPort } = proxyConfig.spec;
+        console.log(`  Proxy: ${scheme}://${proxyHost}:${proxyPort}`);
       } else {
-        console.log('  Proxy: disabled (set SIGNAL_PROXY_URL)');
+        console.log('  Proxy: disabled (SIGNAL_PROXY_URL or PUT /api/admin/proxy)');
       }
       const nestBase = nestApiBaseFromEnv();
       if (nestBase) {
@@ -553,6 +761,9 @@ export async function startServer(): Promise<http.Server> {
       } else {
         console.log('  Nest proxy: disabled (set SIGNAL_NEST_API_BASE)');
       }
+      server.on('close', () => {
+        releaseInstanceLock();
+      });
       resolve(server);
     });
   });
@@ -583,6 +794,7 @@ if (isLaunchedAsServerEntry()) {
     }
     shuttingDown = true;
     console.log(`\n[server] ${signal} received, closing database…`);
+    releaseInstanceLock();
     closeSQL()
       .catch(err => console.error('[server] sql close failed:', err))
       .finally(() => process.exit(0));

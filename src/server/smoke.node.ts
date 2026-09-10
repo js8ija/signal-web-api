@@ -17,7 +17,7 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import { join, resolve as resolvePath } from 'node:path';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { encode as msgpackEncode, decode as msgpackDecode } from '@msgpack/msgpack';
 import WebSocket from 'ws';
 
@@ -34,6 +34,9 @@ delete process.env.SIGNAL_NEST_API_BASE;
 delete process.env.NEST_API_BASE;
 delete process.env.SIGNAL_PROXY_URL;
 delete process.env.SIGNAL_NO_PROXY;
+// Existing HTTP/WS cases talk to a loopback process without a host token.
+// /api/admin/* still requires the minted file token.
+process.env.SIGNAL_API_AUTH = 'off';
 // Set BEFORE startServer() — boot payload is cached on first getBootPayload().
 // HTTPS_PROXY must not leak into /api/boot (and is otherwise unconsumed).
 process.env.HTTPS_PROXY = 'http://user:s3cret@h:3128';
@@ -48,8 +51,18 @@ import { closeSQL } from './sql.node.ts';
 import { invokeNative } from './native.node.ts';
 import { isAllowedProxyUrl, isAllowedProxyHost } from './proxy.node.ts';
 import { resolveNestUpstreamUrl, nestApiBaseFromEnv } from './nest-proxy.node.ts';
-import { isFsInside, getDataDir, getProxyConfig, redactProxyText, redactProxyUrl } from './paths.node.ts';
+import {
+  clearRuntimeProxyOverride,
+  getDataDir,
+  getProxyConfig,
+  isFsInside,
+  redactProxyText,
+  redactProxyUrl,
+} from './paths.node.ts';
 import { signalFetch } from './signalFetch.node.ts';
+import { mintApiToken, isAllowedHostHeader, isAllowedOrigin } from './auth.node.ts';
+import { acquireInstanceLock } from './lock.node.ts';
+import { loadOrCreateSqlKey } from './sql.node.ts';
 
 let serverInstance: HttpServer | null = null;
 let serverPort = 0;
@@ -94,6 +107,48 @@ function httpGet(url: string, acceptMsgpack = false): Promise<{ status: number; 
       }));
     });
     req.on('error', reject);
+  });
+}
+
+function httpRequest(
+  url: string,
+  options: {
+    method?: string;
+    headers?: Record<string, string>;
+    body?: Buffer;
+  } = {}
+): Promise<{ status: number; body: Buffer; headers: http.IncomingHttpHeaders }> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const headers: Record<string, string> = { ...(options.headers ?? {}) };
+    if (options.body != null && headers['Content-Length'] == null) {
+      headers['Content-Length'] = String(options.body.length);
+    }
+    const req = http.request(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port,
+        path: `${parsed.pathname}${parsed.search}`,
+        method: options.method ?? 'GET',
+        headers,
+      },
+      res => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () =>
+          resolve({
+            status: res.statusCode ?? 0,
+            body: Buffer.concat(chunks),
+            headers: res.headers,
+          })
+        );
+      }
+    );
+    req.on('error', reject);
+    if (options.body != null && options.body.length > 0) {
+      req.write(options.body);
+    }
+    req.end();
   });
 }
 
@@ -339,10 +394,23 @@ async function runSmoke(): Promise<void> {
     assert(res.status === 200, `Expected 200, got ${res.status}`);
     const body = JSON.parse(res.body.toString('utf-8')) as {
       ok: boolean;
+      auth?: boolean;
       proxy?: { enabled: boolean };
     };
     assert(body.ok === true, 'health.ok should be true');
+    assert(body.auth === false, 'health.auth should be false when SIGNAL_API_AUTH=off');
     assert(body.proxy?.enabled === false, 'health.proxy.enabled should be false without SIGNAL_PROXY_URL');
+    assert(
+      res.headers['access-control-allow-origin'] !== '*',
+      'CORS must not default to *'
+    );
+    const withOrigin = await httpRequest(`${base}/api/health`, {
+      headers: { Origin: `http://127.0.0.1:${serverPort}` },
+    });
+    assert(
+      withOrigin.headers['access-control-allow-origin'] === `http://127.0.0.1:${serverPort}`,
+      `expected echoed Origin, got ${String(withOrigin.headers['access-control-allow-origin'])}`
+    );
   });
 
   await test('proxy allowlist: apex captcha host allowed, others rejected', async () => {
@@ -675,6 +743,152 @@ async function runSmoke(): Promise<void> {
     }
   });
 
+  await test('instance lock rejects a second acquire on the same data dir', async () => {
+    let threw = false;
+    try {
+      acquireInstanceLock(tmpDir);
+    } catch (error) {
+      threw = true;
+      assert(
+        String((error as Error).message).includes('already in use'),
+        `unexpected lock error: ${(error as Error).message}`
+      );
+    }
+    assert(threw, 'expected second acquireInstanceLock to fail');
+  });
+
+  await test('Host/Origin allowlists reject evil browsers', async () => {
+    assert(
+      isAllowedHostHeader(`127.0.0.1:${serverPort}`, serverPort),
+      'loopback Host must be allowed'
+    );
+    assert(!isAllowedHostHeader('evil.example', serverPort), 'foreign Host must be rejected');
+    assert(isAllowedOrigin(undefined, serverPort), 'missing Origin is allowed');
+    assert(
+      isAllowedOrigin(`http://127.0.0.1:${serverPort}`, serverPort),
+      'loopback Origin must be allowed'
+    );
+    assert(!isAllowedOrigin('https://evil.example', serverPort), 'foreign Origin must be rejected');
+
+    const evilOrigin = await httpRequest(`${base}/api/boot`, {
+      headers: { Origin: 'https://evil.example' },
+    });
+    assert(evilOrigin.status === 403, `expected 403 for evil Origin, got ${evilOrigin.status}`);
+
+    const badHost = await httpRequest(`${base}/api/boot`, {
+      headers: { Host: 'evil.example' },
+    });
+    assert(badHost.status === 403, `expected 403 for evil Host, got ${badHost.status}`);
+  });
+
+  await test('loadOrCreateSqlKey accepts 64-hex and rejects Desktop encryptedKey / short keys', async () => {
+    const keyDir = mkdtempSync(join(os.tmpdir(), 'signal-web-key-'));
+    const encDir = mkdtempSync(join(os.tmpdir(), 'signal-web-enc-'));
+    const shortDir = mkdtempSync(join(os.tmpdir(), 'signal-web-short-'));
+    try {
+      const first = loadOrCreateSqlKey(keyDir);
+      assert(/^[0-9a-f]{64}$/i.test(first), `expected 64 hex, got ${first}`);
+      assert(loadOrCreateSqlKey(keyDir) === first, 'existing key must be reused');
+
+      writeFileSync(join(encDir, 'config.json'), JSON.stringify({ encryptedKey: 'desktop-wrapped' }));
+      let encThrew = false;
+      try {
+        loadOrCreateSqlKey(encDir);
+      } catch (error) {
+        encThrew = true;
+        assert(
+          String((error as Error).message).includes('encryptedKey'),
+          `expected encryptedKey error, got ${(error as Error).message}`
+        );
+      }
+      assert(encThrew, 'encryptedKey-only config must throw');
+
+      writeFileSync(join(shortDir, 'config.json'), JSON.stringify({ key: 'abcd' }));
+      let shortThrew = false;
+      try {
+        loadOrCreateSqlKey(shortDir);
+      } catch (error) {
+        shortThrew = true;
+        assert(
+          String((error as Error).message).includes('64 hex'),
+          `expected 64-hex error, got ${(error as Error).message}`
+        );
+      }
+      assert(shortThrew, 'short key must throw');
+    } finally {
+      rmSync(keyDir, { recursive: true, force: true });
+      rmSync(encDir, { recursive: true, force: true });
+      rmSync(shortDir, { recursive: true, force: true });
+    }
+  });
+
+  await test('/api/admin/proxy always needs a token and hot-swaps tracked ConnectionManagers', async () => {
+    const token = readFileSync(join(tmpDir, 'api-token'), 'utf-8').trim();
+    assert(/^[0-9a-f]{64}$/i.test(token), 'minted api-token must be 64 hex');
+    assert(mintApiToken(tmpDir) === token, 'mintApiToken must reuse the existing file token');
+
+    const denied = await httpRequest(`${base}/api/admin/proxy`);
+    assert(denied.status === 401, `admin GET without token should be 401, got ${denied.status}`);
+
+    const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+    const call = (method: string, args: unknown[]): Promise<unknown> =>
+      invokeNative(method, args, null, pending, null);
+    const map = await call('BridgedStringMap_new', [0]);
+    const existing = await call('ConnectionManager_new', [1, 'signal-web-smoke', map, 0]);
+    const before = await call('TESTING_ConnectionManager_isUsingProxy', [existing]);
+    assert(before === 0, `existing CM should start off-proxy, got ${String(before)}`);
+
+    const put = await httpRequest(`${base}/api/admin/proxy`, {
+      method: 'PUT',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: Buffer.from(JSON.stringify({ url: 'http://127.0.0.1:3128' })),
+    });
+    assert(put.status === 200, `admin PUT should be 200, got ${put.status} ${put.body.toString()}`);
+    const putBody = JSON.parse(put.body.toString('utf-8')) as {
+      enabled: boolean;
+      host?: string;
+    };
+    assert(putBody.enabled === true, 'PUT should enable the proxy');
+    assert(putBody.host === '127.0.0.1', `expected host 127.0.0.1, got ${String(putBody.host)}`);
+
+    const afterPut = await call('TESTING_ConnectionManager_isUsingProxy', [existing]);
+    assert(afterPut === 1, `existing CM should use proxy after PUT, got ${String(afterPut)}`);
+
+    const mapNew = await call('BridgedStringMap_new', [0]);
+    const created = await call('ConnectionManager_new', [1, 'signal-web-smoke', mapNew, 0]);
+    const onNew = await call('TESTING_ConnectionManager_isUsingProxy', [created]);
+    assert(onNew === 1, `new CM should inherit runtime proxy, got ${String(onNew)}`);
+
+    const invalid = await httpRequest(`${base}/api/admin/proxy`, {
+      method: 'PUT',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: Buffer.from(JSON.stringify({ url: 'http://127.0.0.1:3128/path' })),
+    });
+    assert(invalid.status === 400, `invalid proxy URL should be 400, got ${invalid.status}`);
+    const stillOn = JSON.parse(
+      (
+        await httpRequest(`${base}/api/admin/proxy`, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+      ).body.toString('utf-8')
+    ) as { enabled: boolean };
+    assert(stillOn.enabled === true, 'invalid PUT must leave the previous proxy in place');
+
+    const del = await httpRequest(`${base}/api/admin/proxy`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert(del.status === 200, `admin DELETE should be 200, got ${del.status}`);
+    const afterDel = await call('TESTING_ConnectionManager_isUsingProxy', [existing]);
+    assert(afterDel === 0, `existing CM should clear proxy after DELETE, got ${String(afterDel)}`);
+  });
+
   // ---- Summary ---------------------------------------------------------------
   console.log(`\n${'─'.repeat(40)}`);
   console.log(`Results: ${passed} passed, ${failed} failed out of ${passed + failed} tests`);
@@ -684,6 +898,7 @@ async function runSmoke(): Promise<void> {
 // ---- run --------------------------------------------------------------------
 
 runSmoke().finally(async () => {
+  clearRuntimeProxyOverride();
   // Close the SQLCipher workers gracefully first — terminating the process
   // with the DB open aborts in the sqlcipher NAPI finalizer.
   try {
