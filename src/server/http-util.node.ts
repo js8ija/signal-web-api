@@ -24,6 +24,10 @@ export function applyCors(
     'Content-Type, Accept, Authorization'
   );
   res.setHeader('Vary', 'Origin');
+  if (req.headers['access-control-request-private-network'] === 'true') {
+    // Chrome HTTPS page → http://127.0.0.1 preflight (Private Network Access).
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  }
   if (origin) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Credentials', 'true');

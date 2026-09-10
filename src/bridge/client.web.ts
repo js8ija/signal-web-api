@@ -24,6 +24,7 @@ import {
   fromWireError,
   toWireError,
 } from './protocol.std.ts';
+import { apiAuthHeaders, apiHttpUrl, apiWsUrl, resolveRemoteApi } from './origin.web.ts';
 
 type PendingRequest = {
   resolve: (value: unknown) => void;
@@ -85,8 +86,11 @@ export class BridgeClient {
     if (this.#socket != null || this.#closedForGood) {
       return;
     }
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${proto}//${window.location.host}${BRIDGE_WS_PATH}`;
+    const api = resolveRemoteApi();
+    if (api == null) {
+      return;
+    }
+    const url = apiWsUrl(BRIDGE_WS_PATH, api);
     const socket = new WebSocket(url);
     socket.binaryType = 'arraybuffer';
     this.#socket = socket;
@@ -288,9 +292,16 @@ export class BridgeClient {
       args,
     };
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', BRIDGE_SYNC_PATH, false);
+    const api = resolveRemoteApi();
+    if (api == null) {
+      throw new Error('bridge: missing loopback apiOrigin (open with ?apiOrigin=http://127.0.0.1:8915)');
+    }
+    xhr.open('POST', apiHttpUrl(BRIDGE_SYNC_PATH, api), false);
     xhr.overrideMimeType('text/plain; charset=x-user-defined');
     xhr.setRequestHeader('content-type', 'application/x-msgpack');
+    for (const [header, value] of Object.entries(apiAuthHeaders(api))) {
+      xhr.setRequestHeader(header, value);
+    }
     xhr.send(encode(frame, { ignoreUndefined: true, useBigInt64: true }));
     if (xhr.status !== 200) {
       throw new Error(

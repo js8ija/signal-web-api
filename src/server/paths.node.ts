@@ -18,6 +18,9 @@
  *                        does not mount Desktop UI bundles (API-only mode).
  *   SIGNAL_CORS_ORIGIN   Concrete CORS origin. Default is loopback (not *).
  *   SIGNAL_ALLOWED_ORIGINS  Extra comma-separated browser origins.
+ *   SIGNAL_WEB_UI_URL    Hosted UI base (e.g. https://app.example.com/).
+ *                        Its origin is allowlisted; /open redirects here
+ *                        with ?apiOrigin=http://127.0.0.1:<port>.
  *   SIGNAL_API_AUTH      Default on. Set `off` to skip bearer checks (not /api/admin).
  *   SIGNAL_PUBLIC_HOST   Extra allowed Host header name (local supervisor).
  *   SIGNAL_PROXY_URL     Outbound proxy for server-side Signal egress.
@@ -77,6 +80,12 @@ export function getLocaleHint(): string {
 
 export function getCorsOrigin(): string {
   return process.env.SIGNAL_CORS_ORIGIN?.trim() || '';
+}
+
+/** Public page that will be opened with ?apiOrigin= pointing at this process. */
+export function getWebUiUrl(): string | undefined {
+  const raw = process.env.SIGNAL_WEB_UI_URL?.trim();
+  return raw ? raw : undefined;
 }
 
 export type ProxySpec = {
