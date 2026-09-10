@@ -16,8 +16,10 @@
  *                        (default: process.cwd() — run from package root)
  *   STATIC_ROOT          Optional Desktop UI static root. If unset, the server
  *                        does not mount Desktop UI bundles (API-only mode).
- *   SIGNAL_CORS_ORIGIN   CORS Allow-Origin (default *). Set a concrete origin
- *                        to lock down cross-origin browser access.
+ *   SIGNAL_CORS_ORIGIN   Concrete CORS origin. Default is loopback (not *).
+ *   SIGNAL_ALLOWED_ORIGINS  Extra comma-separated browser origins.
+ *   SIGNAL_API_AUTH      Default on. Set `off` to skip bearer checks (not /api/admin).
+ *   SIGNAL_PUBLIC_HOST   Extra allowed Host header name (local supervisor).
  *   SIGNAL_PROXY_URL     Outbound proxy for server-side Signal egress.
  *                        http/https and socks/socks4/socks4a/socks5/socks5h.
  *                        Other schemes (incl. org.signal.tls) fail startup.
@@ -74,7 +76,7 @@ export function getLocaleHint(): string {
 }
 
 export function getCorsOrigin(): string {
-  return process.env.SIGNAL_CORS_ORIGIN?.trim() || '*';
+  return process.env.SIGNAL_CORS_ORIGIN?.trim() || '';
 }
 
 export type ProxySpec = {
@@ -184,8 +186,18 @@ function parseProxyUrl(raw: string): ProxyConfig {
   return { mode: 'on', spec, raw };
 }
 
-/** Reads SIGNAL_PROXY_URL. Does not fall back to HTTPS_PROXY. */
+type RuntimeProxy = { kind: 'env' } | { kind: 'off' } | { kind: 'url'; raw: string };
+
+let runtimeProxy: RuntimeProxy = { kind: 'env' };
+
+/** Reads runtime override first, then SIGNAL_PROXY_URL. Never HTTPS_PROXY. */
 export function getProxyConfig(): ProxyConfig {
+  if (runtimeProxy.kind === 'off') {
+    return { mode: 'off' };
+  }
+  if (runtimeProxy.kind === 'url') {
+    return parseProxyUrl(runtimeProxy.raw);
+  }
   const envRaw = process.env.SIGNAL_PROXY_URL;
   if (cachedProxyConfig !== undefined && cachedProxyEnv === envRaw) {
     return cachedProxyConfig;
@@ -195,6 +207,28 @@ export function getProxyConfig(): ProxyConfig {
   cachedProxyEnv = envRaw;
   cachedProxyConfig = parsed;
   return parsed;
+}
+
+/**
+ * Supervisor hot-swap. `null` / empty disables the proxy (clears env fallback).
+ * Invalid URLs are returned and the previous override is left unchanged.
+ */
+export function setRuntimeProxyUrl(raw: string | null): ProxyConfig {
+  if (raw == null || raw.trim() === '') {
+    runtimeProxy = { kind: 'off' };
+    return { mode: 'off' };
+  }
+  const parsed = parseProxyUrl(raw.trim());
+  if (parsed.mode === 'invalid') {
+    return parsed;
+  }
+  runtimeProxy = { kind: 'url', raw: raw.trim() };
+  return parsed;
+}
+
+/** Forget the supervisor override; subsequent reads use SIGNAL_PROXY_URL again. */
+export function clearRuntimeProxyOverride(): void {
+  runtimeProxy = { kind: 'env' };
 }
 
 function normalizeProxyHost(host: string): string {

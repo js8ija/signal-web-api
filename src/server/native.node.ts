@@ -394,8 +394,11 @@ export async function invokeNative(
     trace(`call ${method} → ok`);
   }
 
-  if (method === 'ConnectionManager_new' && getProxyConfig().mode === 'on') {
-    applyLibsignalProxy(resolved);
+  if (method === 'ConnectionManager_new') {
+    trackConnectionManager(resolved);
+    if (getProxyConfig().mode === 'on') {
+      applyLibsignalProxy(resolved);
+    }
   }
 
   return encodeResult(resolved);
@@ -403,6 +406,13 @@ export async function invokeNative(
 
 let loggedLibsignalProxyApply = false;
 let loggedLibsignalProxyFail = false;
+const trackedManagers = new Set<unknown>();
+
+function trackConnectionManager(resolved: unknown): void {
+  if (resolved != null) {
+    trackedManagers.add(resolved);
+  }
+}
 
 function applyLibsignalProxy(resolved: unknown): void {
   const cfg = getProxyConfig();
@@ -461,4 +471,33 @@ function applyLibsignalProxy(resolved: unknown): void {
     }
     throw error;
   }
+}
+
+function nativeClearProxy(resolved: unknown): void {
+  const clear = Native.ConnectionManager_clear_proxy as
+    | ((cm: { _nativeHandle: unknown }) => void)
+    | undefined;
+  clear?.({ _nativeHandle: resolved });
+}
+
+/** Apply or clear the current getProxyConfig() on every live ConnectionManager. */
+export function applyProxyToTrackedManagers(): { ok: number; failed: number } {
+  loggedLibsignalProxyApply = false;
+  loggedLibsignalProxyFail = false;
+  const cfg = getProxyConfig();
+  let ok = 0;
+  let failed = 0;
+  for (const resolved of trackedManagers) {
+    try {
+      if (cfg.mode === 'on') {
+        applyLibsignalProxy(resolved);
+      } else {
+        nativeClearProxy(resolved);
+      }
+      ok += 1;
+    } catch {
+      failed += 1;
+    }
+  }
+  return { ok, failed };
 }
