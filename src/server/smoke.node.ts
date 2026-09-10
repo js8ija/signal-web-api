@@ -48,7 +48,7 @@ import { closeSQL } from './sql.node.ts';
 import { invokeNative } from './native.node.ts';
 import { isAllowedProxyUrl, isAllowedProxyHost } from './proxy.node.ts';
 import { resolveNestUpstreamUrl, nestApiBaseFromEnv } from './nest-proxy.node.ts';
-import { isFsInside, getDataDir, getProxyConfig, redactProxyUrl } from './paths.node.ts';
+import { isFsInside, getDataDir, getProxyConfig, redactProxyText, redactProxyUrl } from './paths.node.ts';
 import { signalFetch } from './signalFetch.node.ts';
 
 let serverInstance: HttpServer | null = null;
@@ -525,6 +525,69 @@ async function runSmoke(): Promise<void> {
     const redacted = redactProxyUrl('http://user:s3cret@h:3128');
     assert(!redacted.includes('user'), `redacted still contains user: ${redacted}`);
     assert(!redacted.includes('s3cret'), `redacted still contains password: ${redacted}`);
+  });
+
+  await test('signalFetch errors redact password from message and cause', async () => {
+    const closing = http.createServer();
+    closing.on('connect', (_req, clientSocket) => {
+      clientSocket.destroy();
+    });
+    const closingPort = await new Promise<number>((resolve, reject) => {
+      closing.once('error', reject);
+      closing.listen(0, '127.0.0.1', () => {
+        const addr = closing.address();
+        resolve(typeof addr === 'object' && addr ? addr.port : 0);
+      });
+    });
+    const prev = process.env.SIGNAL_PROXY_URL;
+    process.env.SIGNAL_PROXY_URL = `http://myuser:sup3rs3cret@127.0.0.1:${closingPort}`;
+    try {
+      let err: Error | undefined;
+      try {
+        await signalFetch(new URL('https://cdn.signal.org/'), { timeoutMs: 5_000 });
+      } catch (error) {
+        err = error instanceof Error ? error : new Error(String(error));
+      }
+      assert(err != null, 'expected proxied signalFetch to fail when CONNECT closes');
+      assert(
+        !err.message.includes('sup3rs3cret'),
+        `err.message leaked password: ${err.message}`
+      );
+      const causeMessage = (err.cause as Error | undefined)?.message;
+      assert(
+        causeMessage == null || !causeMessage.includes('sup3rs3cret'),
+        `err.cause.message leaked password: ${causeMessage}`
+      );
+    } finally {
+      if (prev === undefined) {
+        delete process.env.SIGNAL_PROXY_URL;
+      } else {
+        process.env.SIGNAL_PROXY_URL = prev;
+      }
+      await new Promise<void>(resolve => closing.close(() => resolve()));
+    }
+  });
+
+  await test('redactProxyText does not over-replace a one-character username', async () => {
+    const prev = process.env.SIGNAL_PROXY_URL;
+    process.env.SIGNAL_PROXY_URL = 'http://s:sup3rs3cret@h:3128';
+    try {
+      const unrelated = 'socket hang up connecting to host';
+      const redacted = redactProxyText(unrelated);
+      assert(
+        redacted === unrelated,
+        `one-char username mangled unrelated text: ${redacted}`
+      );
+      const withSecret = redactProxyText('socket failed: sup3rs3cret');
+      assert(!withSecret.includes('sup3rs3cret'), `password survived: ${withSecret}`);
+      assert(withSecret.includes('socket'), `unrelated word dropped: ${withSecret}`);
+    } finally {
+      if (prev === undefined) {
+        delete process.env.SIGNAL_PROXY_URL;
+      } else {
+        process.env.SIGNAL_PROXY_URL = prev;
+      }
+    }
   });
 
   // TESTING_ConnectionManager_isUsingProxy returns a number. Observed

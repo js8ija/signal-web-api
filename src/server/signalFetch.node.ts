@@ -17,6 +17,7 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import {
   getAssetsRoot,
   getProxyConfig,
+  redactProxyText,
   redactProxyUrl,
   shouldBypassProxy,
 } from './paths.node.ts';
@@ -53,41 +54,19 @@ const PROXY_CONNECT_TIMEOUT_MS = 15_000;
 
 const proxyAgents = new Map<string, InstanceType<typeof HttpsProxyAgent>>();
 
-function redactProxyText(text: string): string {
-  const cfg = getProxyConfig();
-  let out = text;
-  if (cfg.mode === 'off') {
-    return out;
-  }
-  const redacted = redactProxyUrl(cfg.raw);
-  if (cfg.raw && out.includes(cfg.raw)) {
-    out = out.split(cfg.raw).join(redacted);
-  }
-  try {
-    const href = new URL(cfg.raw).href;
-    if (href && href !== cfg.raw && out.includes(href)) {
-      out = out.split(href).join(redactProxyUrl(href));
-    }
-  } catch {
-    // raw may be unparseable when mode is invalid
-  }
-  if (cfg.mode === 'on') {
-    if (cfg.spec.password && out.includes(cfg.spec.password)) {
-      out = out.split(cfg.spec.password).join('***');
-    }
-    if (cfg.spec.username && out.includes(cfg.spec.username)) {
-      out = out.split(cfg.spec.username).join('***');
-    }
-  }
-  return out;
-}
-
 function sanitizeProxyError(error: unknown): Error {
-  const message = redactProxyText(error instanceof Error ? error.message : String(error));
-  const err = new Error(message);
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  const err = new Error(redactProxyText(rawMessage));
   if (error instanceof Error) {
     err.name = error.name;
-    err.cause = error;
+    if (typeof error.stack === 'string') {
+      err.stack = redactProxyText(error.stack);
+    }
+    // Never attach the original Error: /api/proxy prefers cause.message for
+    // its 502 body. Recurse so any nested cause is sanitized too.
+    if (error.cause != null) {
+      err.cause = sanitizeProxyError(error.cause);
+    }
   }
   return err;
 }

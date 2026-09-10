@@ -259,6 +259,81 @@ export function redactProxyUrl(raw: string): string {
   }
 }
 
+function replaceLiteral(haystack: string, needle: string, replacement: string): string {
+  if (!needle || !haystack.includes(needle)) {
+    return haystack;
+  }
+  return haystack.split(needle).join(replacement);
+}
+
+/**
+ * Strip proxy credentials from an arbitrary log or error string.
+ * Replaces the configured URL (raw + href), userinfo forms (`user:pass@`,
+ * `user@`), and any password substring. Does not bare-replace a short
+ * username — that would mangle unrelated words (`s` → `***ocket`).
+ */
+export function redactProxyText(text: string): string {
+  const cfg = getProxyConfig();
+  if (cfg.mode === 'off') {
+    return text;
+  }
+  let out = text;
+  if (cfg.raw) {
+    out = replaceLiteral(out, cfg.raw, redactProxyUrl(cfg.raw));
+    try {
+      const href = new URL(cfg.raw).href;
+      if (href && href !== cfg.raw) {
+        out = replaceLiteral(out, href, redactProxyUrl(href));
+      }
+    } catch {
+      // raw may be unparseable when mode is invalid
+    }
+  }
+
+  let username: string | undefined;
+  let password: string | undefined;
+  if (cfg.mode === 'on') {
+    username = cfg.spec.username;
+    password = cfg.spec.password;
+  } else {
+    try {
+      const url = new URL(cfg.raw);
+      if (url.username !== '') {
+        username = decodeURIComponent(url.username);
+      }
+      if (url.password !== '') {
+        password = decodeURIComponent(url.password);
+      }
+    } catch {
+      // keep username/password unset
+    }
+  }
+
+  if (username && password) {
+    out = replaceLiteral(out, `${username}:${password}@`, '***@');
+    const encUser = encodeURIComponent(username);
+    const encPass = encodeURIComponent(password);
+    if (encUser !== username || encPass !== password) {
+      out = replaceLiteral(out, `${encUser}:${encPass}@`, '***@');
+    }
+  }
+  if (username) {
+    out = replaceLiteral(out, `${username}@`, '***@');
+    const encUser = encodeURIComponent(username);
+    if (encUser !== username) {
+      out = replaceLiteral(out, `${encUser}@`, '***@');
+    }
+  }
+  if (password) {
+    out = replaceLiteral(out, password, '***');
+    const encPass = encodeURIComponent(password);
+    if (encPass !== password) {
+      out = replaceLiteral(out, encPass, '***');
+    }
+  }
+  return out;
+}
+
 export function sqlWorkerPath(): string {
   return join(getAssetsRoot(), 'bundles', 'workers', 'sql.js');
 }

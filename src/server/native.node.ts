@@ -28,7 +28,7 @@ import {
   isWireCallback,
   toWireError,
 } from '../bridge/protocol.std.ts';
-import { getProxyConfig, redactProxyUrl } from './paths.node.ts';
+import { getProxyConfig, redactProxyText, redactProxyUrl } from './paths.node.ts';
 
 // ---- handle registry ----------------------------------------------------------
 
@@ -454,13 +454,9 @@ function applyLibsignalProxy(resolved: unknown): void {
     if (!loggedLibsignalProxyFail) {
       loggedLibsignalProxyFail = true;
       const detail = error instanceof Error ? error.message : String(error);
-      const redacted =
-        cfg.raw && detail.includes(cfg.raw)
-          ? detail.split(cfg.raw).join(redactProxyUrl(cfg.raw))
-          : detail;
       console.error(
         `[native] libsignal proxy apply failed; refusing connections (${redactProxyUrl(cfg.raw)}):`,
-        redacted
+        redactProxyText(detail)
       );
     }
     throw error;
