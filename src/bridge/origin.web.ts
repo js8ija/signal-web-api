@@ -111,11 +111,12 @@ export function rememberRemoteApi(api: RemoteApi): void {
   storageSet(STORAGE_TOKEN, api.token);
 }
 
-function sameOriginFallback(): string | undefined {
-  if (typeof window === 'undefined') {
+function servedByApiOrigin(): string | undefined {
+  if (typeof document === 'undefined') {
     return undefined;
   }
-  return canonicalizeLoopbackApiOrigin(window.location.origin);
+  const raw = document.querySelector('meta[name="signal-web-api-origin"]')?.getAttribute('content');
+  return raw ? canonicalizeLoopbackApiOrigin(raw) : undefined;
 }
 
 /**
@@ -131,8 +132,7 @@ export function resolveRemoteApi(
   const origin =
     fromUrl.apiOrigin ??
     (storedOrigin ? canonicalizeLoopbackApiOrigin(storedOrigin) : undefined) ??
-    canonicalizeLoopbackApiOrigin(loc.origin) ??
-    sameOriginFallback();
+    servedByApiOrigin();
   if (!origin) {
     return undefined;
   }

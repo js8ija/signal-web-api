@@ -207,6 +207,22 @@ function serveStaticFile(urlPath: string, res: http.ServerResponse): boolean {
         if (extname(candidate).toLowerCase() === '.css') {
           content = Buffer.from(content.toString('utf-8').replaceAll('asset:///', '/'), 'utf-8');
         }
+        if (
+          extname(candidate).toLowerCase() === '.html' &&
+          resolve(mount.root) === resolve(getConsoleRoot())
+        ) {
+          const selfOrigin = publicApiOrigin(boundPort || getPort());
+          const html = content.toString('utf-8');
+          if (!html.includes('name="signal-web-api-origin"')) {
+            content = Buffer.from(
+              html.replace(
+                '</head>',
+                `    <meta name="signal-web-api-origin" content="${selfOrigin}" />\n  </head>`
+              ),
+              'utf-8'
+            );
+          }
+        }
         // App code and the shell must always revalidate (dynamic imports
         // bypass hard-reload cache busting); immutable-ish assets may cache.
         const isAppCode =

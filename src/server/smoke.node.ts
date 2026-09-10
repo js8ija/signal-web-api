@@ -912,9 +912,11 @@ async function runSmoke(): Promise<void> {
   await test('console page and /api/connect pair a hosted UI to loopback', async () => {
     const page = await httpGet(`${base}/`);
     assert(page.status === 200, `GET / should be 200, got ${page.status}`);
+    const html = page.body.toString('utf-8');
+    assert(html.includes('apiOrigin'), 'console HTML must mention apiOrigin');
     assert(
-      page.body.toString('utf-8').includes('apiOrigin'),
-      'console HTML must mention apiOrigin'
+      html.includes(`name="signal-web-api-origin"`) && html.includes(publicApiOrigin(serverPort)),
+      'API-served console must stamp a self apiOrigin meta'
     );
 
     const connect = await httpGet(`${base}/api/connect`);

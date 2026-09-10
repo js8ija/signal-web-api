@@ -57,10 +57,11 @@ function resolveRemoteApi() {
   } catch {
     /* ignore */
   }
+  const meta = document.querySelector('meta[name="signal-web-api-origin"]')?.getAttribute('content');
   const origin =
     fromUrl.apiOrigin ||
     canonicalizeLoopbackApiOrigin(storedOrigin || '') ||
-    canonicalizeLoopbackApiOrigin(location.origin);
+    canonicalizeLoopbackApiOrigin(meta || '');
   if (!origin) return undefined;
   const token = fromUrl.token || storedToken;
   return token ? { origin, token } : { origin };
